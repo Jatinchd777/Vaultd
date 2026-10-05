@@ -25,8 +25,8 @@ $ vaultd init
 $ vaultd unlock
 # type the master password, you get a vault shell
 
-# save a secret (prompts without echoing)
-$ vaultd add API_KEY
+# save a secret
+$ vaultd add API_KEY your_secret_here
 Credential added: API_KEY
 
 # apps read it like any other env var
@@ -97,7 +97,7 @@ Unlocking works like this:
 
 1. Your password goes through Argon2id with the salt and settings from the manifest. Out comes the key.
 2. The key decrypts the vault file. The encryption is authenticated, so a wrong password looks exactly like a damaged file. Either way you get an error and nothing else.
-3. A background daemon holds the decrypted vault in memory. It listens on a Unix socket that only your user can connect to. The `vaultd` commands do not touch keys or ciphertext themselves, they just ask the daemon over that socket.
+3. A background daemon holds the decrypted vault in memory. It listens on a Unix socket that only your user can connect to. Past this point the `vaultd` commands never see keys or ciphertext themselves, they just ask the daemon over that socket.
 4. Your shell gets the credentials as environment variables. When you exit the shell, or run `vaultd lock`, the daemon clears its memory, removes the socket, and stops.
 
 Each `add`, `set`, and `remove` encrypts the full set of credentials again with a new random nonce before writing. The file on disk never holds old plaintext and never repeats encryption randomness.
@@ -116,7 +116,7 @@ Committing `.vaultd` is safe because all an attacker gets is ciphertext, a salt,
 
 On lock, the daemon zeroes the key and the decrypted secrets. That shrinks how long they sit in RAM. It cannot pull back copies your shell, scrollback, or child processes already hold.
 
-Once locked, the daemon no longer retains the decrypted vault or key, disk holds ciphertext again.
+Once locked, nothing secret remains in memory. The key and plaintext are gone and disk holds ciphertext again.
 
 What vaultd does not do:
 
@@ -130,7 +130,7 @@ A weak password breaks the whole thing, because the salt and settings ship with 
 
 The manifest is JSON: format version, cipher name, key derivation algorithm with salt and cost settings. The vault file is binary: a random nonce up front, then the ciphertext, which decrypts to the JSON list of credentials. Point `xxd` at it and you will see noise.
 
-Back up `.vaultd` somewhere safe like project root directory. Without the password it is unreadable, so losing the files is the same as losing the secrets.
+Back up `.vaultd` somewhere safe, off that machine. Without the password it is unreadable, so losing the files is the same as losing the secrets.
 
 ## Development
 
