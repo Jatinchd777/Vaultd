@@ -1,8 +1,18 @@
+<div align="center">
+
 # vaultd
 
-Encrypted secrets for local development, with the convenience of `.env`.
+_Encrypted secrets for local development that work like `.env`._
 
-`.env` files are convenient and also plaintext. They end up in dotfiles, screenshots, backups, and eventually a git commit. `vaultd` keeps the part you like — secrets showing up as environment variables in your dev shell — while the secrets themselves live on disk encrypted, in files you can commit without a second thought.
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
+![Built with Rust](https://img.shields.io/badge/built_with-Rust-orange?style=flat-square&logo=rust)
+![Platform: Linux](https://img.shields.io/badge/platform-Linux-yellow?style=flat-square&logo=linux)
+
+[Quick start](#quick-start) · [Installation](#installation) · [Usage](#usage) · [How it works](#how-it-works) · [Security](#security)
+
+</div>
+
+Most of us have committed a `.env` file at least once. vaultd exists so you can stop worrying about that. Secrets live on disk encrypted, and when you need them they show up as ordinary environment variables in your shell.
 
 ## Quick start
 
@@ -11,27 +21,27 @@ Encrypted secrets for local development, with the convenience of `.env`.
 $ vaultd init
 # pick a master password when asked
 
-# every dev session starts here
+# start of every dev session
 $ vaultd unlock
-# enter the master password — you land in a vault shell
+# type the master password, you get a vault shell
 
-# store a secret (value is prompted, never echoed)
+# save a secret (prompts without echoing)
 $ vaultd add API_KEY
 Credential added: API_KEY
 
-# your app changes nothing — it just reads the environment
+# apps read it like any other env var
 $ python app.py
 
 $ vaultd list
-# ... shows names only, never values
+# names only, values stay hidden
 
 $ exit
 # leaving the shell locks the vault
 ```
 
-That's the whole loop: `unlock` gives you a shell with secrets exported, `exit` (or `vaultd lock`) wipes them from memory and shuts everything down. What stays behind in the project is ciphertext.
+While unlocked you work in a shell that has your secrets. When you leave, the secrets are wiped from memory and the vault locks itself. The project directory keeps only ciphertext.
 
-Commit `.vaultd`. Never commit — or store anywhere — the master password. There is no recovery if you lose it.
+Commit `.vaultd` to git. Keep the master password out of it, and out of everywhere else too. Forget the password and the vault is gone. There is no reset flow.
 
 ## Installation
 
@@ -41,72 +51,79 @@ cd Vaultd
 cargo build --release
 ```
 
-The binary lands at `target/release/vaultd`; put it somewhere on your `PATH`.
+This gives you `target/release/vaultd`. Move it onto your `PATH` and you are done.
 
-Requirements: a Rust toolchain, Linux, and `zsh` (the vault shell runs on `zsh`).
+You need a Rust toolchain, Linux, and `zsh`, since the vault shell runs on `zsh`.
 
 ## Usage
 
-Run everything from the project root, where `.vaultd/` lives. All commands except `init` need an unlocked vault, so `unlock` always comes first.
+Run these from the project root, where `.vaultd` sits. Except for `init`, every command needs an unlocked vault, so `unlock` comes first.
 
 | Command | What it does |
 |---|---|
-| `vaultd init` | Create `.vaultd/` and set the master password |
-| `vaultd unlock` | Verify the password, start the daemon, enter the vault shell |
-| `vaultd add <NAME> [VALUE]` | Store a new credential; fails if the name already exists |
-| `vaultd set <NAME> [VALUE]` | Update an existing credential; fails if the name is missing |
-| `vaultd get <NAME>` | Print a credential's value |
+| `vaultd init` | Create `.vaultd` and set the master password |
+| `vaultd unlock` | Check the password, start the daemon, open the vault shell |
+| `vaultd add <NAME> [VALUE]` | Store a new credential, errors if the name exists |
+| `vaultd set <NAME> [VALUE]` | Update a credential, errors if the name is missing |
+| `vaultd get <NAME>` | Print a credential value |
 | `vaultd remove <NAME>` | Delete a credential |
-| `vaultd list` | List credential names (never values) |
-| `vaultd lock` | Lock the vault from any terminal |
+| `vaultd list` | Show credential names, never values |
+| `vaultd lock` | Lock the vault, from any terminal |
 
-`add` and `set` are intentionally separate: `add` refuses to overwrite, `set` refuses to create. A typo fails loudly instead of silently destroying or duplicating a secret.
+`add` creates and `set` updates. Mixing them up gives you an error instead of quietly overwriting something or creating a duplicate.
 
-Omit `VALUE` and you're prompted for it with echo disabled — prefer this. Passing a secret inline works, but then it sits in your shell history and is visible to other processes while the command runs.
+Skip `VALUE` and vaultd will ask for it without echoing. That is the better habit. Typed inline, a secret lands in shell history and shows up in the process list while the command runs.
 
 ## How it works
 
-Each project carries its vault with it:
+A project carries two files:
 
 ```
 .vaultd/
-├── manifest    # plaintext parameters: format version, cipher, key-derivation settings and salt
+├── manifest    # how to open the vault: version, cipher, key derivation settings and salt
 └── vault       # the encrypted credentials
 ```
 
-`manifest` holds everything needed to re-derive the encryption key later — which algorithm, which parameters, which salt. None of that is secret. `vault` holds the actual credentials (names and values together) as one encrypted blob.
+The manifest is plain JSON. It has to be, since it tells vaultd how to re-derive your key: which algorithm, which settings, which salt. None of that is sensitive. The vault file is the sensitive part. It holds every credential name and value in one encrypted blob.
 
-Unlocking goes like this:
+Unlocking works like this:
 
-1. Derive the key from the master password using the parameters and salt in `manifest`.
-2. Decrypt `vault`. The encryption is authenticated, so a wrong password and a tampered file fail the same way: no decryption, no partial output, no hints about which it was.
-3. A background daemon takes over from there. It keeps the decrypted vault in memory and answers requests from `vaultd` commands over a Unix socket that only your user can reach. The commands themselves never see the key or the ciphertext — they're thin clients talking to the daemon.
-4. You get a shell with the credentials exported as environment variables. When you leave the shell — or run `vaultd lock` — the daemon wipes its memory, removes the socket, and exits.
+1. Your password goes through Argon2id with the salt and settings from the manifest. Out comes the key.
+2. The key decrypts the vault file. The encryption is authenticated, so a wrong password looks exactly like a damaged file. Either way you get an error and nothing else.
+3. A background daemon holds the decrypted vault in memory. It listens on a Unix socket that only your user can connect to. The `vaultd` commands do not touch keys or ciphertext themselves, they just ask the daemon over that socket.
+4. Your shell gets the credentials as environment variables. When you exit the shell, or run `vaultd lock`, the daemon clears its memory, removes the socket, and stops.
 
-Every change (`add`, `set`, `remove`) re-encrypts the whole credential set with a fresh random nonce before writing it back, so the file on disk never contains stale plaintext and never reuses encryption randomness.
+Each `add`, `set`, and `remove` encrypts the full set of credentials again with a new random nonce before writing. The file on disk never holds old plaintext and never repeats encryption randomness.
 
-## Security model
+## Security
 
-The honest version, since this holds real secrets:
+Since this guards real secrets, here is what it does and where it stops.
 
-- **What's encrypted:** credential names and values, together, in a single blob sealed with AES-256-GCM. GCM provides confidentiality and integrity as one property — modified ciphertext doesn't decrypt to something wrong, it fails to decrypt at all.
-- **Key derivation:** the master password is stretched with Argon2id and a random per-vault salt created at `init`. Re-deriving the key takes the same work every time you unlock, and guessing takes the same work per attempt for an attacker.
-- **The password is never stored.** Not in the repo, not in a config file, nowhere on disk. It exists briefly at unlock time to derive the key. Forgetting it means losing the vault — that irreversibility is the price of never writing it down.
-- **Why the vault is safe to commit:** anyone with the repo gets ciphertext plus the salt and derivation parameters. Those parameters are public by design. The master password is the entire defense against offline guessing, so it needs to be a strong one — a generated passphrase, not a memorable word.
-- **Memory hygiene:** the daemon zeroes its key and plaintext when it shuts down, on `lock` and on shell exit. That closes the window secrets spend in RAM; it can't retract copies your shell, terminal scrollback, or child processes already made.
-- **Locked means gone:** once the daemon exits, key and plaintext exist nowhere. Disk holds ciphertext again.
+The blob is sealed with AES-256-GCM, which covers secrecy and tampering in one go. Edited ciphertext does not decrypt to something wrong. It does not decrypt at all.
 
-And the boundaries, stated plainly:
+The key comes from Argon2id with a random salt made at `init` time. Deriving it costs real work on every unlock, and the same work per guess for anyone trying passwords offline.
 
-- Once a secret is exported into a shell environment, `vaultd` can't protect it further. Shell history, process listings, core dumps, a compromised dependency — all outside what a tool like this can cover. It protects secrets **at rest** and **on the way to your processes**, not from your processes.
-- While unlocked, anything running as your user can ask the daemon for secrets. That's inherent to the design: your dev server needs that same access.
-- A weak master password undermines everything, because the salt and parameters travel with the repo and guessing can happen offline.
+The password itself is never written anywhere. It is only in memory for the moment it takes to derive the key. That is why forgetting it is final.
+
+Committing `.vaultd` is safe because all an attacker gets is ciphertext, a salt, and derivation settings. The salt and settings are public on purpose. The password is the whole defense against offline guessing, so it should be a generated passphrase, not a word you picked.
+
+On lock, the daemon zeroes the key and the decrypted secrets. That shrinks how long they sit in RAM. It cannot pull back copies your shell, scrollback, or child processes already hold.
+
+Once locked, nothing secret remains. The key and plaintext are gone and disk holds ciphertext again.
+
+What vaultd does not do:
+
+Once a secret is in your shell environment, it is out of vaultd's hands. Shell history, process listings, core dumps, a bad dependency phoning home, none of that is something this kind of tool can stop. It protects secrets at rest and on the way to your programs. After that, your programs own them.
+
+While the vault is unlocked, any process running as you can ask the daemon for secrets. That is how your dev server gets them too. There is no way to allow one and block the other.
+
+A weak password breaks the whole thing, because the salt and settings ship with the repo and guesses can be tried offline without limits.
 
 ## Storage format
 
-`manifest` is JSON describing how to open the vault: a format version, the cipher in use, and the key-derivation algorithm with its salt and cost parameters. `vault` is binary: a fresh random nonce followed by the ciphertext, which decrypts to the JSON list of credentials. Inspecting it with `xxd` shows noise, which is exactly the idea.
+The manifest is JSON: format version, cipher name, key derivation algorithm with salt and cost settings. The vault file is binary: a random nonce up front, then the ciphertext, which decrypts to the JSON list of credentials. Point `xxd` at it and you will see noise.
 
-Back up `.vaultd` like anything irreplaceable — with the password gone, the ciphertext is permanent noise.
+Back up `.vaultd` somewhere safe. Without the password it is unreadable, so losing the files is the same as losing the secrets.
 
 ## Development
 
@@ -116,8 +133,8 @@ cargo run -- --help
 cargo run -- <command> --help
 ```
 
-The source mirrors the architecture: `cli` defines the commands, `commands` implements them, `crypto` handles key derivation and encryption, `storage` owns the `.vaultd` file layout, `vault` owns unlocking and in-memory secrets, and `daemon` owns the IPC protocol and the unlock-session lifecycle.
+The code is split the way the system is: `cli` declares the commands, `commands` carries them out, `crypto` does key derivation and encryption, `storage` handles the `.vaultd` files, `vault` handles unlocking and the in-memory secrets, `daemon` handles the IPC protocol and the unlock session.
 
 ## License
 
-GPL-3.0 — see [LICENSE](LICENSE).
+GPL-3.0, see [LICENSE](LICENSE).
