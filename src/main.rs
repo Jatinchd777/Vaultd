@@ -1,15 +1,8 @@
-mod cli;
-mod commands;
-mod crypto;
-mod daemon;
-mod error;
-mod storage;
-mod vault;
-
 use anyhow::Result;
 use clap::Parser;
 
-use cli::Cli;
+use vaultd::cli::Cli;
+use vaultd::commands;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
