@@ -116,7 +116,7 @@ Committing `.vaultd` is safe because all an attacker gets is ciphertext, a salt,
 
 On lock, the daemon zeroes the key and the decrypted secrets. That shrinks how long they sit in RAM. It cannot pull back copies your shell, scrollback, or child processes already hold.
 
-Once locked, nothing secret remains. The key and plaintext are gone and disk holds ciphertext again.
+Once locked, the daemon no longer retains the decrypted vault or key, disk holds ciphertext again.
 
 What vaultd does not do:
 
@@ -130,7 +130,7 @@ A weak password breaks the whole thing, because the salt and settings ship with 
 
 The manifest is JSON: format version, cipher name, key derivation algorithm with salt and cost settings. The vault file is binary: a random nonce up front, then the ciphertext, which decrypts to the JSON list of credentials. Point `xxd` at it and you will see noise.
 
-Back up `.vaultd` somewhere safe. Without the password it is unreadable, so losing the files is the same as losing the secrets.
+Back up `.vaultd` somewhere safe like project root directory. Without the password it is unreadable, so losing the files is the same as losing the secrets.
 
 ## Development
 
