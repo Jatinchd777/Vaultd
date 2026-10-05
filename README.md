@@ -46,12 +46,19 @@ Commit `.vaultd` to git. Keep the master password out of it, and out of everywhe
 ## Installation
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/Jatinchd777/Vaultd/main/install.sh | sh
+```
+
+That clones the repo, builds with `cargo build --release`, and copies the binary to `~/.local/bin`. If that directory is not on your `PATH`, the script tells you what to add to your shell rc file.
+
+Doing it by hand works too:
+
+```sh
 git clone https://github.com/Jatinchd777/Vaultd
 cd Vaultd
 cargo build --release
+cp target/release/vaultd ~/.local/bin/
 ```
-
-This gives you `target/release/vaultd`. Move it onto your `PATH` and you are done.
 
 You need a Rust toolchain, Linux, and `zsh`, since the vault shell runs on `zsh`.
 
