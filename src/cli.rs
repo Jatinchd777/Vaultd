@@ -19,23 +19,24 @@ pub enum Command {
     /// Unlock the vault and verify the master password.
     Unlock,
 
-    /// Locks the vault from accessing it
+    /// Lock the vault.
     Lock,
 
-    /// Get the value of the env variable
+    /// Get the value of a credential.
     Get {
-        /// Name of the env variable
+        /// Name of the credential.
         name: String,
     },
 
-    /// Set the value of env variable
+    /// Update the value of a credential.
     Set {
-        /// Name of the env variable
+        /// Name of the credential.
         name: String,
-        /// new updating Value
+        /// New value. If omitted, prompt securely.
         value: Option<String>,
     },
 
+    /// Store a new credential.
     Add {
         /// Credential name.
         name: String,
@@ -44,9 +45,9 @@ pub enum Command {
         value: Option<String>,
     },
 
-    /// Removes the env variable
+    /// Remove a credential.
     Remove {
-        /// Name of the env variable
+        /// Name of the credential.
         name: String,
     },
 

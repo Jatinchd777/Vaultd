@@ -3,7 +3,7 @@
   "cipher": "AES-256-GCM",
   "kdf": {
     "algorithm": "Argon2id",
-    "salt": "m6/JWIB4PbMBa3lX7W0zbA==",
+    "salt": "ucUdGssh3uM22N2doAiyyQ==",
     "memory_cost": 19456,
     "time_cost": 2,
     "parallelism": 1
