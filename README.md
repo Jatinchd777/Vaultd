@@ -64,7 +64,7 @@ You need a Rust toolchain, Linux, and `zsh`, since the vault shell runs on `zsh`
 
 ## Usage
 
-Run these from the project root, where `.vaultd` sits. Except for `init`, every command needs an unlocked vault, so `unlock` comes first.
+Run these from anywhere inside the project — vaultd finds `.vaultd` by walking up. Except for `init`, every command needs an unlocked vault, so `unlock` comes first.
 
 | Command | What it does |
 |---|---|
@@ -75,7 +75,7 @@ Run these from the project root, where `.vaultd` sits. Except for `init`, every 
 | `vaultd get <NAME>` | Print a credential value |
 | `vaultd remove <NAME>` | Delete a credential |
 | `vaultd list` | Show credential names, never values |
-| `vaultd lock` | Lock the vault, from any terminal |
+| `vaultd lock` | Lock the current project's vault |
 
 `add` creates and `set` updates. Mixing them up gives you an error instead of quietly overwriting something or creating a duplicate.
 
@@ -97,7 +97,7 @@ Unlocking works like this:
 
 1. Your password goes through Argon2id with the salt and settings from the manifest. Out comes the key.
 2. The key decrypts the vault file. The encryption is authenticated, so a wrong password looks exactly like a damaged file. Either way you get an error and nothing else.
-3. A background daemon holds the decrypted vault in memory. It listens on a Unix socket that only your user can connect to. Past this point the `vaultd` commands never see keys or ciphertext themselves, they just ask the daemon over that socket.
+3. A background daemon holds the decrypted vault in memory. It listens on a per-project Unix socket under `$XDG_RUNTIME_DIR/vaultd` that only your user can connect to, so one project's commands never reach another project's daemon. Past this point the `vaultd` commands never see keys or ciphertext themselves, they just ask the daemon over that socket.
 4. Your shell gets the credentials as environment variables. When you exit the shell, or run `vaultd lock`, the daemon clears its memory, removes the socket, and stops.
 
 Each `add`, `set`, and `remove` encrypts the full set of credentials again with a new random nonce before writing. The file on disk never holds old plaintext and never repeats encryption randomness.
