@@ -1,7 +1,7 @@
 //! CLI surface: help output, argument validation, and behavior when no
 //! daemon is running. None of these need a vault on disk.
 
-use crate::common::{stderr, stdout, Env};
+use crate::common::{Env, stderr, stdout};
 
 #[test]
 fn help_lists_subcommands() {
@@ -49,9 +49,28 @@ fn commands_without_daemon_fail() {
         &["list"],
         &["lock"],
     ];
+    // Outside any vault: fail fast with no-vault, never touching daemons.
     for args in cases {
         let out = env.run(args, "");
-        assert!(!out.status.success(), "{args:?} should fail without a daemon");
+        assert!(
+            !out.status.success(),
+            "{args:?} should fail without a vault"
+        );
+        assert!(
+            stderr(&out).contains("no vault found"),
+            "{args:?}: unexpected stderr: {}",
+            stderr(&out)
+        );
+    }
+
+    // Inside a vault but with no daemon: per-project socket missing.
+    crate::common::init_vault(&env, "correct horse battery staple");
+    for args in cases {
+        let out = env.run(args, "");
+        assert!(
+            !out.status.success(),
+            "{args:?} should fail without a daemon"
+        );
         assert!(
             stderr(&out).contains("vaultd daemon is not running"),
             "{args:?}: unexpected stderr: {}",

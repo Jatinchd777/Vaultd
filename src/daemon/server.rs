@@ -9,20 +9,72 @@ use std::{
 };
 
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 
 use super::protocol::{Request, Response};
-use crate::vault::vault::Vault;
+use crate::storage::filesystem;
+use crate::vault::store::Vault;
 
-pub fn socket_path() -> PathBuf {
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+pub const SOCKET_ENV: &str = "VAULTD_SOCKET";
 
-    runtime_dir.join("vaultd.sock")
+pub fn runtime_base_dir() -> Result<PathBuf> {
+    let base = match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("vaultd"),
+        _ => {
+            let uid = unsafe { libc::getuid() };
+            std::env::temp_dir().join(format!("vaultd-{uid}"))
+        }
+    };
+
+    if !base.exists() {
+        fs::create_dir_all(&base)?;
+        let _ = fs::set_permissions(&base, fs::Permissions::from_mode(0o700));
+    } else {
+        let _ = fs::set_permissions(&base, fs::Permissions::from_mode(0o700));
+    }
+
+    Ok(base)
+}
+
+pub fn project_hash(project_root: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(project_root.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+pub fn socket_path_for_project(project_root: &Path, runtime_base: &Path) -> PathBuf {
+    runtime_base.join(format!("vaultd-{}.sock", project_hash(project_root)))
+}
+
+pub fn current_project_socket_path() -> Result<PathBuf> {
+    let project_root = filesystem::find_project_root()?;
+    let runtime_base = runtime_base_dir()?;
+    let path = socket_path_for_project(&project_root, &runtime_base);
+
+    if path.as_os_str().as_encoded_bytes().len() >= 108 {
+        anyhow::bail!("vaultd socket path too long for {}", path.display());
+    }
+
+    Ok(path)
+}
+
+pub fn socket_path() -> Result<PathBuf> {
+    if let Some(sock) = std::env::var_os(SOCKET_ENV)
+        && !sock.is_empty()
+    {
+        return Ok(PathBuf::from(sock));
+    }
+
+    current_project_socket_path()
 }
 
 pub fn is_running() -> Result<bool> {
-    let path = socket_path();
+    let path = current_project_socket_path()?;
 
     if !path.exists() {
         return Ok(false);
@@ -31,26 +83,13 @@ pub fn is_running() -> Result<bool> {
     match UnixStream::connect(&path) {
         Ok(_) => Ok(true),
         Err(_) => {
-            fs::remove_file(path)?;
+            fs::remove_file(&path)?;
             Ok(false)
         }
     }
 }
 
-/// Spawn the daemon and replace the caller with the dedicated vault shell.
-///
-/// Forks once: the child becomes the daemon (holds `Vault`, serves the
-/// Unix socket, pidfd-monitors the parent pid). The parent waits for the
-/// daemon's ready byte, drops its `Vault` copy (Zeroize via `Drop`), then
-/// `exec`s `$SHELL`. Because `exec` preserves the pid, the daemon's pidfd
-/// — opened on the parent pid *before* `exec` — pins that exact shell
-/// process with no PID-reuse race.
-///
-/// Vault zeroization stays in `vault.rs` (`Zeroize`/`Drop`: memory hygiene
-/// only). Daemon shutdown below is a separate concern: break the event
-/// loop, `drop` the listener, `drop` the `Vault` (which triggers Zeroize),
-/// unlink the socket, exit.
-pub fn spawn_daemon_and_shell(vault: Vault) -> Result<()> {
+pub fn spawn_daemon_and_shell(vault: Vault, socket_path: PathBuf) -> Result<()> {
     let mut pipe_fds = [0 as libc::c_int; 2];
 
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
@@ -104,7 +143,7 @@ pub fn spawn_daemon_and_shell(vault: Vault) -> Result<()> {
             }
         }
 
-        let path = socket_path();
+        let path = socket_path;
         let result = daemon_main(vault, pidfd, pipe_fds[1], &path);
 
         unsafe {
@@ -118,7 +157,6 @@ pub fn spawn_daemon_and_shell(vault: Vault) -> Result<()> {
         }
     }
 
-    // Parent: future vault shell.
     unsafe {
         libc::close(pipe_fds[1]);
     }
@@ -147,25 +185,31 @@ pub fn spawn_daemon_and_shell(vault: Vault) -> Result<()> {
         }
     }
 
-    // Parent copy of secrets is no longer needed; the daemon holds its own
-    // forked copy. Explicit drop triggers Zeroize before the shell image
-    // replaces this process.
     drop(vault);
 
-    exec_vault_shell()
+    exec_vault_shell(&socket_path)
 }
 
-/// Daemon body: bind, signal readiness, serve until `Lock` or shell exit,
-/// then shut down (drop listener, drop `Vault` -> Zeroize, unlink socket).
 fn daemon_main(vault: Vault, pidfd: RawFd, ready_fd: RawFd, path: &Path) -> Result<()> {
     detach_standard_streams();
+
+    if let Some(parent) = path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            let _ = write_byte(ready_fd, 1);
+            unsafe {
+                libc::close(ready_fd);
+            }
+            return Err(error.into());
+        }
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    }
 
     if path.exists() {
         let _ = write_byte(ready_fd, 1);
         unsafe {
             libc::close(ready_fd);
         }
-        anyhow::bail!("vaultd daemon socket already exists");
+        anyhow::bail!("vaultd daemon socket already exists for this project");
     }
 
     let listener = match UnixListener::bind(path) {
@@ -198,7 +242,6 @@ fn daemon_main(vault: Vault, pidfd: RawFd, ready_fd: RawFd, path: &Path) -> Resu
         return Err(error.into());
     }
 
-    // Ready: parent may now exec the vault shell.
     if write_byte(ready_fd, 0).is_err() {
         drop(listener);
         let _ = fs::remove_file(path);
@@ -215,9 +258,6 @@ fn daemon_main(vault: Vault, pidfd: RawFd, ready_fd: RawFd, path: &Path) -> Resu
     let mut vault = vault;
     let _reason = serve_loop(&listener, &mut vault, pidfd)?;
 
-    // Daemon shutdown (lifecycle). Vault zeroization happens as a side
-    // effect of this `drop` via `Vault::drop` -> `Zeroize`; it does not
-    // itself stop the loop, unlink the socket, or exit the process.
     drop(listener);
     drop(vault);
     let _ = fs::remove_file(path);
@@ -231,8 +271,6 @@ enum ShutdownReason {
     ShellExited,
 }
 
-/// Poll the listener and the shell pidfd. Returns when the shell dies
-/// (pidfd readable) or a `Lock` request arrives.
 fn serve_loop(listener: &UnixListener, vault: &mut Vault, pidfd: RawFd) -> Result<ShutdownReason> {
     let listener_fd = listener.as_raw_fd();
 
@@ -438,17 +476,7 @@ fn detach_standard_streams() {
     }
 }
 
-/// Replace this process (the unlock parent) with the dedicated interactive
-/// vault shell. Same pid, so the daemon's pidfd now monitors the shell
-/// itself. Chain is `zsh -i -c 'eval "$(vaultd __env)"; exec zsh -i'`:
-/// the launcher evaluates `__env` once to import credentials as env vars,
-/// then `exec`s the final interactive zsh in the same pid. No persistent
-/// launcher remains; the transient `__env` child has a different pid and
-/// never touches the daemon's pidfd.
-/// If `exec` fails we return; dropping back through `main` exits this pid,
-/// which makes the daemon's pidfd readable so it self-terminates — no
-/// orphan daemon, no extra IPC.
-fn exec_vault_shell() -> Result<()> {
+fn exec_vault_shell(socket_path: &Path) -> Result<()> {
     use std::io::Write;
     use std::os::unix::process::CommandExt;
 
@@ -466,6 +494,7 @@ fn exec_vault_shell() -> Result<()> {
         .arg("-i")
         .arg("-c")
         .arg(script)
+        .env(SOCKET_ENV, socket_path)
         .exec();
 
     anyhow::bail!("failed to spawn vault shell (zsh): {err}")

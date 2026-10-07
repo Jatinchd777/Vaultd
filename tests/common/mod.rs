@@ -39,12 +39,8 @@ pub struct TempDir {
 impl TempDir {
     pub fn new(tag: &str) -> Self {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!(
-            "vaultd-test-{}-{}-{}",
-            std::process::id(),
-            tag,
-            n
-        ));
+        let path =
+            std::env::temp_dir().join(format!("vaultd-test-{}-{}-{}", std::process::id(), tag, n));
         if path.exists() {
             std::fs::remove_dir_all(&path).unwrap();
         }
@@ -86,7 +82,10 @@ impl Env {
     }
 
     pub fn socket(&self) -> PathBuf {
-        self.runtime.path().join("vaultd.sock")
+        let project_root = std::fs::canonicalize(self.project.path())
+            .unwrap_or_else(|_| self.project.path().to_path_buf());
+        let runtime_base = self.runtime.path().join("vaultd");
+        vaultd::daemon::server::socket_path_for_project(&project_root, &runtime_base)
     }
 
     fn base_command(&self, args: &[&str]) -> Command {
@@ -96,6 +95,8 @@ impl Env {
             .env("XDG_RUNTIME_DIR", self.runtime.path())
             .env("HOME", self.home.path())
             .env("TERM", "dumb");
+        // Never leak the outer shell's project binding into test children.
+        cmd.env_remove("VAULTD_SOCKET");
         cmd
     }
 
@@ -160,6 +161,107 @@ impl Env {
     }
 }
 
+/// Socket for an explicit project + runtime dir pair (shared-runtime tests).
+/// Mirrors `vaultd::daemon::server` derivation: canonical root hashed into
+/// `<runtime>/vaultd/vaultd-<hash>.sock`. Resolves upward like the binary,
+/// so subdirectories map to their project root.
+pub fn socket_for(project: &Path, runtime: &Path) -> PathBuf {
+    let root = vaultd::storage::filesystem::find_project_root_from(project).unwrap_or_else(|_| {
+        std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf())
+    });
+    let base = runtime.join("vaultd");
+    vaultd::daemon::server::socket_path_for_project(&root, &base)
+}
+
+fn base_command_in(project: &Path, runtime: &Path, home: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new(binary());
+    cmd.args(args)
+        .current_dir(project)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("HOME", home)
+        .env("TERM", "dumb");
+    cmd.env_remove("VAULTD_SOCKET");
+    cmd
+}
+
+/// Non-interactive run against explicit dirs (shared `XDG_RUNTIME_DIR`).
+pub fn run_in(project: &Path, runtime: &Path, home: &Path, args: &[&str]) -> Output {
+    let mut cmd = base_command_in(project, runtime, home, args);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().expect("failed to spawn vaultd");
+    drop(child.stdin.take());
+    wait_output(&mut child, TIMEOUT, &format!("vaultd {args:?}"))
+}
+
+/// Pty run against explicit dirs, for `init`/`unlock` prompts.
+pub fn spawn_pty_in(project: &Path, runtime: &Path, home: &Path, args: &[&str]) -> PtySession {
+    let pty = Pty::open();
+    let slave_path = pty.slave_path();
+    let open_slave = || {
+        let bytes = slave_path.as_os_str().as_bytes();
+        let fd = unsafe { libc::open(bytes.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        assert!(fd >= 0, "failed to open pty slave");
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    };
+    let mut cmd = base_command_in(project, runtime, home, args);
+    cmd.stdin(Stdio::from(open_slave()))
+        .stdout(Stdio::from(open_slave()))
+        .stderr(Stdio::from(open_slave()));
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().expect("failed to spawn vaultd");
+    PtySession { child, pty }
+}
+
+pub fn init_vault_in(project: &Path, runtime: &Path, home: &Path, password: &str) {
+    let mut session = spawn_pty_in(project, runtime, home, &["init"]);
+    session.pty.read_until("Create master password:", TIMEOUT);
+    session.pty.send(&format!("{password}\n"));
+    session.pty.read_until("Confirm master password:", TIMEOUT);
+    session.pty.send(&format!("{password}\n"));
+    session.pty.read_until("Vault initialized", TIMEOUT);
+    let status = wait_exit(&mut session.child, TIMEOUT, "vaultd init");
+    assert!(status.success(), "init failed with {status}");
+}
+
+pub fn wait_for_path(path: &Path, timeout: Duration) {
+    let start = Instant::now();
+    while !path.exists() {
+        if start.elapsed() >= timeout {
+            panic!("{path:?} never appeared");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+}
+
+pub fn wait_for_gone_path(path: &Path, timeout: Duration) {
+    let start = Instant::now();
+    while path.exists() {
+        if start.elapsed() >= timeout {
+            panic!("{path:?} never disappeared");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// A child attached to a real pty, for commands that prompt for passwords.
 pub struct PtySession {
     pub child: Child,
@@ -181,8 +283,7 @@ pub fn spawn_pty(env: &Env, args: &[&str]) -> PtySession {
     let slave_path = pty.slave_path();
     let open_slave = || {
         let bytes = slave_path.as_os_str().as_bytes();
-        let fd =
-            unsafe { libc::open(bytes.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        let fd = unsafe { libc::open(bytes.as_ptr() as *const libc::c_char, libc::O_RDWR) };
         assert!(fd >= 0, "failed to open pty slave");
         unsafe { OwnedFd::from_raw_fd(fd) }
     };

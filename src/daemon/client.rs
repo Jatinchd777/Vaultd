@@ -8,7 +8,8 @@ use super::{
 };
 
 fn request(request: Request) -> Result<Response> {
-    let mut stream = UnixStream::connect(server::socket_path())
+    let socket = server::socket_path()?;
+    let mut stream = UnixStream::connect(&socket)
         .map_err(|_| anyhow::anyhow!("vaultd daemon is not running"))?;
 
     serde_json::to_writer(&mut stream, &request)?;

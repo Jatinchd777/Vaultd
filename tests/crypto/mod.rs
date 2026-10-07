@@ -2,14 +2,14 @@
 //! shape, the opacity of the vault file, fresh randomness per vault, and
 //! init-time failure modes.
 
+use crate::common::{Env, TIMEOUT, init_vault, spawn_pty, wait_exit};
 use base64::Engine;
-use crate::common::{init_vault, spawn_pty, wait_exit, Env, TIMEOUT};
 
 const PASSWORD: &str = "correct horse battery staple";
 
 fn manifest(env: &Env) -> serde_json::Value {
-    let bytes = std::fs::read(env.project.path().join(".vaultd/manifest"))
-        .expect("manifest should exist");
+    let bytes =
+        std::fs::read(env.project.path().join(".vaultd/manifest")).expect("manifest should exist");
     serde_json::from_slice(&bytes).expect("manifest should be JSON")
 }
 
@@ -77,9 +77,7 @@ fn mismatched_passwords_abort_init() {
     session.pty.send("one\n");
     session.pty.read_until("Confirm master password:", TIMEOUT);
     session.pty.send("two\n");
-    let transcript = session
-        .pty
-        .read_until("passwords do not match", TIMEOUT);
+    let transcript = session.pty.read_until("passwords do not match", TIMEOUT);
     assert!(transcript.contains("passwords do not match"));
     let status = wait_exit(&mut session.child, TIMEOUT, "vaultd init");
     assert!(!status.success());
@@ -95,9 +93,7 @@ fn second_init_refuses_to_overwrite() {
     init_vault(&env, PASSWORD);
     let before = vault_bytes(&env);
     let mut session = spawn_pty(&env, &["init"]);
-    session
-        .pty
-        .read_until("already exists", TIMEOUT);
+    session.pty.read_until("already exists", TIMEOUT);
     let status = wait_exit(&mut session.child, TIMEOUT, "vaultd init");
     assert!(!status.success());
     // The existing vault is untouched.

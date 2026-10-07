@@ -6,7 +6,6 @@ use clap::{Parser, Subcommand};
     version,
     about = "Secure project-local credential management"
 )]
-
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

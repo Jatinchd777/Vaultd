@@ -1,40 +1,16 @@
-// use anyhow::Result;
-//
-// use crate::daemon::client;
-//
-// fn valid_name(name: &str) -> bool {
-//     let mut chars = name.chars();
-//
-//     matches!(
-//         chars.next(),
-//         Some(c) if c == '_' || c.is_ascii_alphabetic()
-//     ) && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
-// }
-//
-// pub fn run() -> Result<()> {
-//     let environment = client::environment()?;
-//
-//     for (name, value) in environment {
-//         if !valid_name(&name) {
-//             anyhow::bail!("invalid environment variable name: {name}");
-//         }
-//
-//         println!("export {name}={}", shell_escape(&value));
-//     }
-//
-//     Ok(())
-// }
-//
-// fn shell_escape(value: &str) -> String {
-//     format!("'{}'", value.replace('\'', "'\\''"))
-// }
-
 use anyhow::Result;
 
-use crate::daemon::client;
+use crate::daemon::{client, server};
 
 pub fn run() -> Result<()> {
+    let socket_path = server::socket_path()?;
     let environment = client::environment()?;
+
+    println!(
+        "export {}={}",
+        server::SOCKET_ENV,
+        shell_escape(&socket_path.to_string_lossy())
+    );
 
     for (name, value) in &environment {
         if !valid_name(name) {
