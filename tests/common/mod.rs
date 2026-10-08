@@ -97,6 +97,7 @@ impl Env {
             .env("TERM", "dumb");
         // Never leak the outer shell's project binding into test children.
         cmd.env_remove("VAULTD_SOCKET");
+        cmd.env_remove("VAULTD_TOKEN");
         cmd
     }
 
@@ -181,6 +182,7 @@ fn base_command_in(project: &Path, runtime: &Path, home: &Path, args: &[&str]) -
         .env("HOME", home)
         .env("TERM", "dumb");
     cmd.env_remove("VAULTD_SOCKET");
+    cmd.env_remove("VAULTD_TOKEN");
     cmd
 }
 

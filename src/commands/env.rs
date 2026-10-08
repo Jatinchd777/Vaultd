@@ -4,12 +4,18 @@ use crate::daemon::{client, server};
 
 pub fn run() -> Result<()> {
     let socket_path = server::socket_path()?;
+    let token = server::load_client_token()?;
     let environment = client::environment()?;
 
     println!(
         "export {}={}",
         server::SOCKET_ENV,
         shell_escape(&socket_path.to_string_lossy())
+    );
+    println!(
+        "export {}={}",
+        server::TOKEN_ENV,
+        shell_escape(&server::encode_token_hex(&token))
     );
 
     for (name, value) in &environment {

@@ -19,6 +19,15 @@ pub enum Request {
     Lock,
 }
 
+/// Wire envelope: every request must present the per-session token.
+/// The token is a 64-char hex encoding of 32 random bytes generated at
+/// `unlock` time. It is never derived from anything guessable.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthenticatedRequest {
+    pub token: String,
+    pub request: Request,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
     Pong,

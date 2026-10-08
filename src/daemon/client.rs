@@ -3,16 +3,45 @@ use std::{io::Read, os::unix::net::UnixStream};
 use anyhow::Result;
 
 use super::{
-    protocol::{Request, Response},
+    protocol::{AuthenticatedRequest, Request, Response},
     server,
 };
 
-fn request(request: Request) -> Result<Response> {
+fn request(body: Request) -> Result<Response> {
     let socket = server::socket_path()?;
+    let token = server::load_client_token()?;
     let mut stream = UnixStream::connect(&socket)
         .map_err(|_| anyhow::anyhow!("vaultd daemon is not running"))?;
 
-    serde_json::to_writer(&mut stream, &request)?;
+    // Verify we are talking to our own daemon before sending secrets.
+    // This blocks spoofed sockets owned by another UID.
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if ret == 0 {
+            let own = unsafe { libc::getuid() };
+            if cred.uid != own {
+                anyhow::bail!("vaultd daemon authentication failed");
+            }
+        }
+    }
+
+    let envelope = AuthenticatedRequest {
+        token: server::encode_token_hex(&token),
+        request: body,
+    };
+    serde_json::to_writer(&mut stream, &envelope)?;
 
     stream.shutdown(std::net::Shutdown::Write)?;
 

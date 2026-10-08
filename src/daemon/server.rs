@@ -1,7 +1,8 @@
 use std::{
     fs,
+    io::Write,
     os::unix::{
-        fs::PermissionsExt,
+        fs::{OpenOptionsExt, PermissionsExt},
         io::{AsRawFd, RawFd},
         net::{UnixListener, UnixStream},
     },
@@ -9,13 +10,17 @@ use std::{
 };
 
 use anyhow::Result;
+use rand::TryRngCore;
+use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
-use super::protocol::{Request, Response};
+use super::protocol::{AuthenticatedRequest, Request, Response};
 use crate::storage::filesystem;
 use crate::vault::store::Vault;
 
 pub const SOCKET_ENV: &str = "VAULTD_SOCKET";
+pub const TOKEN_ENV: &str = "VAULTD_TOKEN";
+pub const TOKEN_BYTES: usize = 32;
 
 pub fn runtime_base_dir() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_RUNTIME_DIR") {
@@ -67,10 +72,181 @@ pub fn socket_path() -> Result<PathBuf> {
     if let Some(sock) = std::env::var_os(SOCKET_ENV)
         && !sock.is_empty()
     {
-        return Ok(PathBuf::from(sock));
+        let path = PathBuf::from(sock);
+        validate_env_socket_path(&path)?;
+        return Ok(path);
     }
 
     current_project_socket_path()
+}
+
+/// Reject `$VAULTD_SOCKET` values pointing outside the runtime dir.
+/// Without this, any env control (direnv, Makefile, plugin) redirects
+/// secrets to an attacker socket.
+fn validate_env_socket_path(path: &Path) -> Result<()> {
+    let runtime_base = runtime_base_dir()?;
+    let runtime_canon = std::fs::canonicalize(&runtime_base).unwrap_or(runtime_base);
+    // Resolve the parent (socket itself may not exist yet for the daemon).
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let parent_canon =
+        std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    if parent_canon != runtime_canon {
+        anyhow::bail!("untrusted VAULTD_SOCKET: must live inside {}", runtime_canon.display());
+    }
+    if path.as_os_str().as_encoded_bytes().len() >= 108 {
+        anyhow::bail!("vaultd socket path too long for {}", path.display());
+    }
+    Ok(())
+}
+
+pub fn token_path_for_project(project_root: &Path, runtime_base: &Path) -> PathBuf {
+    runtime_base.join(format!("vaultd-{}.token", project_hash(project_root)))
+}
+
+pub fn current_project_token_path() -> Result<PathBuf> {
+    let project_root = filesystem::find_project_root()?;
+    let runtime_base = runtime_base_dir()?;
+    Ok(token_path_for_project(&project_root, &runtime_base))
+}
+
+/// Sibling `<socket>.token` for a given socket path.
+/// Used by the daemon (which only knows the bound socket path) and by
+/// clients pinned via `$VAULTD_SOCKET`.
+pub fn token_path_for_socket(socket_path: &Path) -> PathBuf {
+    let file_name = socket_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let token_name = if let Some(stripped) = file_name.strip_suffix(".sock") {
+        format!("{stripped}.token")
+    } else {
+        format!("{file_name}.token")
+    };
+    match socket_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(token_name),
+        _ => PathBuf::from(token_name),
+    }
+}
+
+pub fn generate_session_token() -> Result<[u8; TOKEN_BYTES]> {
+    let mut token = [0u8; TOKEN_BYTES];
+    OsRng
+        .try_fill_bytes(&mut token)
+        .map_err(|e| anyhow::anyhow!("failed to generate session token: {e}"))?;
+    Ok(token)
+}
+
+pub fn encode_token_hex(token: &[u8; TOKEN_BYTES]) -> String {
+    let mut out = String::with_capacity(TOKEN_BYTES * 2);
+    for byte in token {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+pub fn decode_token_hex(s: &str) -> Result<[u8; TOKEN_BYTES]> {
+    let s = s.trim();
+    if s.len() != TOKEN_BYTES * 2 {
+        anyhow::bail!("invalid session token length");
+    }
+    let mut out = [0u8; TOKEN_BYTES];
+    let bytes = s.as_bytes();
+    for i in 0..TOKEN_BYTES {
+        let hi = hex_val(bytes[2 * i])?;
+        let lo = hex_val(bytes[2 * i + 1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn hex_val(c: u8) -> Result<u8> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => anyhow::bail!("invalid session token encoding"),
+    }
+}
+
+/// Constant-time equality to avoid leaking prefix matches via timing.
+fn token_eq(a: &[u8; TOKEN_BYTES], b: &[u8; TOKEN_BYTES]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..TOKEN_BYTES {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+fn write_token_file(path: &Path, token: &[u8; TOKEN_BYTES]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let hex = encode_token_hex(token);
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    opts.mode(0o600);
+    let mut file = opts.open(path)?;
+    file.write_all(hex.as_bytes())?;
+    file.flush()?;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    Ok(())
+}
+
+/// Load the token the client should present:
+/// `$VAULTD_TOKEN` first (vault shell), otherwise the canonical
+/// per-project token file (detached CLI invocations in tests and shell).
+pub fn load_client_token() -> Result<[u8; TOKEN_BYTES]> {
+    if let Some(env) = std::env::var_os(TOKEN_ENV)
+        && !env.is_empty()
+    {
+        let s = env.to_string_lossy().into_owned();
+        return decode_token_hex(&s);
+    }
+    // If the socket is pinned via env, the token sibling lives next to it.
+    if let Some(sock) = std::env::var_os(SOCKET_ENV)
+        && !sock.is_empty()
+    {
+        let sibling = token_path_for_socket(&PathBuf::from(sock));
+        if sibling.exists() {
+            let raw = fs::read_to_string(&sibling)?;
+            return decode_token_hex(&raw);
+        }
+    }
+    let path = current_project_token_path()?;
+    let raw = fs::read_to_string(&path).map_err(|_| anyhow::anyhow!("vaultd daemon is not running"))?;
+    decode_token_hex(&raw).map_err(|_| anyhow::anyhow!("vaultd daemon is not running"))
+}
+
+/// UID of the peer on a Unix socket via `SO_PEERCRED`.
+fn peer_uid(stream: &UnixStream) -> Result<u32> {
+    let fd = stream.as_raw_fd();
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        anyhow::bail!("failed to query peer credentials: {}", std::io::Error::last_os_error());
+    }
+    Ok(cred.uid)
+}
+
+fn check_peer_uid(stream: &UnixStream) -> Result<()> {
+    let peer = peer_uid(stream)?;
+    let own = unsafe { libc::getuid() };
+    if peer != own {
+        anyhow::bail!("vaultd daemon authentication failed");
+    }
+    Ok(())
 }
 
 pub fn is_running() -> Result<bool> {
@@ -80,16 +256,31 @@ pub fn is_running() -> Result<bool> {
         return Ok(false);
     }
 
+    // Never unlink a symlink: a planted link would delete an arbitrary file.
+    if let Ok(meta) = fs::symlink_metadata(&path)
+        && meta.file_type().is_symlink()
+    {
+        anyhow::bail!("vaultd socket path is a symlink: {}", path.display());
+    }
+
     match UnixStream::connect(&path) {
         Ok(_) => Ok(true),
         Err(_) => {
-            fs::remove_file(&path)?;
+            // Only remove stale filesystem sockets, never symlinks.
+            if let Ok(meta) = fs::symlink_metadata(&path) {
+                if !meta.file_type().is_symlink() {
+                    let _ = fs::remove_file(&path);
+                    // Best-effort stale token cleanup alongside the socket.
+                    let _ = fs::remove_file(token_path_for_socket(&path));
+                }
+            }
             Ok(false)
         }
     }
 }
 
 pub fn spawn_daemon_and_shell(vault: Vault, socket_path: PathBuf) -> Result<()> {
+    let session_token = generate_session_token()?;
     let mut pipe_fds = [0 as libc::c_int; 2];
 
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
@@ -144,7 +335,7 @@ pub fn spawn_daemon_and_shell(vault: Vault, socket_path: PathBuf) -> Result<()> 
         }
 
         let path = socket_path;
-        let result = daemon_main(vault, pidfd, pipe_fds[1], &path);
+        let result = daemon_main(vault, pidfd, pipe_fds[1], &path, &session_token);
 
         unsafe {
             libc::close(pidfd);
@@ -187,10 +378,16 @@ pub fn spawn_daemon_and_shell(vault: Vault, socket_path: PathBuf) -> Result<()> 
 
     drop(vault);
 
-    exec_vault_shell(&socket_path)
+    exec_vault_shell(&socket_path, &session_token)
 }
 
-fn daemon_main(vault: Vault, pidfd: RawFd, ready_fd: RawFd, path: &Path) -> Result<()> {
+fn daemon_main(
+    vault: Vault,
+    pidfd: RawFd,
+    ready_fd: RawFd,
+    path: &Path,
+    expected_token: &[u8; TOKEN_BYTES],
+) -> Result<()> {
     detach_standard_streams();
 
     if let Some(parent) = path.parent() {
@@ -232,6 +429,19 @@ fn daemon_main(vault: Vault, pidfd: RawFd, ready_fd: RawFd, path: &Path) -> Resu
         return Err(error.into());
     }
 
+    // Bind succeeded: now publish the session token. Writing after bind
+    // avoids a losing racer clobbering the winner's token file.
+    let token_path = token_path_for_socket(path);
+    if let Err(error) = write_token_file(&token_path, expected_token) {
+        let _ = write_byte(ready_fd, 1);
+        unsafe {
+            libc::close(ready_fd);
+        }
+        drop(listener);
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+
     if let Err(error) = listener.set_nonblocking(true) {
         let _ = write_byte(ready_fd, 1);
         unsafe {
@@ -239,12 +449,14 @@ fn daemon_main(vault: Vault, pidfd: RawFd, ready_fd: RawFd, path: &Path) -> Resu
         }
         drop(listener);
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&token_path);
         return Err(error.into());
     }
 
     if write_byte(ready_fd, 0).is_err() {
         drop(listener);
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&token_path);
         unsafe {
             libc::close(ready_fd);
         }
@@ -256,11 +468,12 @@ fn daemon_main(vault: Vault, pidfd: RawFd, ready_fd: RawFd, path: &Path) -> Resu
     }
 
     let mut vault = vault;
-    let _reason = serve_loop(&listener, &mut vault, pidfd)?;
+    let _reason = serve_loop(&listener, &mut vault, pidfd, expected_token)?;
 
     drop(listener);
     drop(vault);
     let _ = fs::remove_file(path);
+    let _ = fs::remove_file(&token_path);
 
     Ok(())
 }
@@ -271,7 +484,12 @@ enum ShutdownReason {
     ShellExited,
 }
 
-fn serve_loop(listener: &UnixListener, vault: &mut Vault, pidfd: RawFd) -> Result<ShutdownReason> {
+fn serve_loop(
+    listener: &UnixListener,
+    vault: &mut Vault,
+    pidfd: RawFd,
+    expected_token: &[u8; TOKEN_BYTES],
+) -> Result<ShutdownReason> {
     let listener_fd = listener.as_raw_fd();
 
     loop {
@@ -319,7 +537,7 @@ fn serve_loop(listener: &UnixListener, vault: &mut Vault, pidfd: RawFd) -> Resul
                 Ok((stream, _)) => {
                     let _ = stream.set_nonblocking(false);
 
-                    match handle_connection(stream, vault) {
+                    match handle_connection(stream, vault, expected_token) {
                         Ok(true) => return Ok(ShutdownReason::LockRequested),
                         Ok(false) => {}
                         Err(_) => {}
@@ -332,9 +550,33 @@ fn serve_loop(listener: &UnixListener, vault: &mut Vault, pidfd: RawFd) -> Resul
     }
 }
 
-fn handle_connection(mut stream: UnixStream, vault: &mut Vault) -> Result<bool> {
-    let request: Request = serde_json::from_reader(&mut stream)?;
+fn handle_connection(
+    mut stream: UnixStream,
+    vault: &mut Vault,
+    expected_token: &[u8; TOKEN_BYTES],
+) -> Result<bool> {
+    // Defense in depth: filesystem perms already restrict to our UID,
+    // but verify explicitly so a misconfigured umask never opens the vault.
+    if check_peer_uid(&stream).is_err() {
+        let _ = serde_json::to_writer(
+            &mut stream,
+            &Response::Error("vaultd daemon authentication failed".to_string()),
+        );
+        return Ok(false);
+    }
 
+    let envelope: AuthenticatedRequest = serde_json::from_reader(&mut stream)?;
+    let presented = decode_token_hex(&envelope.token)
+        .map_err(|_| anyhow::anyhow!("vaultd daemon authentication failed"))?;
+    if !token_eq(&presented, expected_token) {
+        let _ = serde_json::to_writer(
+            &mut stream,
+            &Response::Error("vaultd daemon authentication failed".to_string()),
+        );
+        return Ok(false);
+    }
+
+    let request = envelope.request;
     let should_stop = matches!(request, Request::Lock);
 
     let response = match request {
@@ -476,7 +718,7 @@ fn detach_standard_streams() {
     }
 }
 
-fn exec_vault_shell(socket_path: &Path) -> Result<()> {
+fn exec_vault_shell(socket_path: &Path, session_token: &[u8; TOKEN_BYTES]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::process::CommandExt;
 
@@ -495,6 +737,7 @@ fn exec_vault_shell(socket_path: &Path) -> Result<()> {
         .arg("-c")
         .arg(script)
         .env(SOCKET_ENV, socket_path)
+        .env(TOKEN_ENV, encode_token_hex(session_token))
         .exec();
 
     anyhow::bail!("failed to spawn vault shell (zsh): {err}")
