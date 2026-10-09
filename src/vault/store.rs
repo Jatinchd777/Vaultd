@@ -4,7 +4,10 @@ use zeroize::Zeroize;
 
 use crate::{
     crypto::{cipher, kdf},
-    storage::{filesystem, format::Manifest},
+    storage::{
+        filesystem,
+        format::{FORMAT_VERSION, KdfConfig, Manifest},
+    },
 };
 
 use super::credential::Credential;
@@ -119,6 +122,47 @@ impl Vault {
         filesystem::write_vault(&encrypted)?;
 
         Ok(())
+    }
+
+    /// Re-encrypt the vault under a new master password.
+    ///
+    /// Verifies `old_password` by unlocking first, then derives a fresh
+    /// key from `new_password` with a new random salt, swaps the key
+    /// in memory (zeroizing the old one), and rewrites manifest + vault.
+    pub fn change_password(old_password: &str, new_password: &str) -> Result<()> {
+        if new_password.is_empty() {
+            anyhow::bail!("new password must not be empty");
+        }
+
+        let mut vault = Self::unlock(old_password)?;
+
+        let params = kdf::KdfParams::generate()?;
+        let mut new_key = kdf::derive_key(new_password.as_bytes(), &params)?;
+
+        vault.key.zeroize();
+        std::mem::swap(&mut vault.key, &mut new_key);
+        new_key.zeroize();
+
+        let manifest = Manifest {
+            version: FORMAT_VERSION,
+            cipher: "AES-256-GCM".to_string(),
+            kdf: KdfConfig {
+                algorithm: "Argon2id".to_string(),
+                salt: base64::engine::general_purpose::STANDARD.encode(params.salt),
+                memory_cost: params.memory_cost,
+                time_cost: params.time_cost,
+                parallelism: params.parallelism,
+            },
+        };
+
+        let manifest_json = serde_json::to_vec_pretty(&manifest)?;
+        filesystem::write_manifest(&manifest_json)?;
+
+        // `save` encrypts with the new key already stored in `vault.key`.
+        vault.save()?;
+
+        Ok(())
+        // `vault` (new key + plaintext) is zeroized on drop.
     }
 
     pub fn credentials(&self) -> &[Credential] {

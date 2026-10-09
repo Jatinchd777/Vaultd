@@ -8,6 +8,7 @@ pub mod get;
 pub mod init;
 pub mod list;
 pub mod lock;
+pub mod passwd;
 pub mod remove;
 pub mod set;
 pub mod unlock;
@@ -22,6 +23,7 @@ pub fn run(command: Command) -> Result<()> {
         Command::Get { name } => get::run(name),
         Command::Add { name, value } => add::run(name, value),
         Command::List => list::run(),
+        Command::Passwd => passwd::run(),
         Command::Env => env::run(),
     }
 }

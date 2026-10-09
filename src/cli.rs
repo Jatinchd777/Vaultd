@@ -54,6 +54,9 @@ pub enum Command {
     /// List credentials stored in the vault.
     List,
 
+    /// Change the master password (prompts, takes no arguments).
+    Passwd,
+
     #[command(name = "__env", hide = true)]
     Env,
 }

@@ -64,12 +64,13 @@ You need a Rust toolchain, Linux, and `zsh`, since the vault shell runs on `zsh`
 
 ## Usage
 
-Run these from anywhere inside the project — vaultd finds `.vaultd` by walking up. Except for `init`, every command needs an unlocked vault, so `unlock` comes first.
+Run these from anywhere inside the project — vaultd finds `.vaultd` by walking up. Except for `init` and `passwd` (which work while locked), every command needs an unlocked vault, so `unlock` comes first.
 
 | Command | What it does |
 |---|---|
 | `vaultd init` | Create `.vaultd` and set the master password |
 | `vaultd unlock` | Check the password, start the daemon, open the vault shell |
+| `vaultd passwd` | Change the master password (prompts, takes no arguments; run while locked) |
 | `vaultd add <NAME> [VALUE]` | Store a new credential, errors if the name exists |
 | `vaultd set <NAME> [VALUE]` | Update a credential, errors if the name is missing |
 | `vaultd get <NAME>` | Print a credential value |
@@ -80,6 +81,8 @@ Run these from anywhere inside the project — vaultd finds `.vaultd` by walking
 `add` creates and `set` updates. Mixing them up gives you an error instead of quietly overwriting something or creating a duplicate.
 
 Skip `VALUE` and vaultd will ask for it without echoing. That is the better habit. Typed inline, a secret lands in shell history and shows up in the process list while the command runs.
+
+`passwd` never takes a password on the command line. It asks for the current password, then the new one twice, with no echo — same as `init`. It re-encrypts everything under a fresh salt, so the old password stops working. If the vault is unlocked, `lock` first.
 
 ## How it works
 
@@ -108,7 +111,7 @@ Since this guards real secrets, here is what it does and where it stops.
 
 The blob is sealed with AES-256-GCM, which covers secrecy and tampering in one go. Edited ciphertext does not decrypt to something wrong. It does not decrypt at all.
 
-The key comes from Argon2id with a random salt made at `init` time. Deriving it costs real work on every unlock, and the same work per guess for anyone trying passwords offline.
+The key comes from Argon2id with a random salt made at `init` time (rotated by `passwd`). Deriving it costs real work on every unlock, and the same work per guess for anyone trying passwords offline.
 
 The password itself is never written anywhere. It is only in memory for the moment it takes to derive the key. That is why forgetting it is final.
 
