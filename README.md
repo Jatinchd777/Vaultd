@@ -4,7 +4,7 @@
 
 _Encrypted vault for local dev secrets that exist only while you work._
 <br>
-<sub>(pronounced: vault-dee)</sub>
+<sub>(pronounced: vault-ied)</sub>
 <br><br>
 
 <a href="LICENSE"><img alt="license" src="https://custom-icon-badges.demolab.com/crates/l/vaultd?color=1C1917&logo=law&style=for-the-badge&logoColor=1C1917&labelColor=FAFAFA"></a>
