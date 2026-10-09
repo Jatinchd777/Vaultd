@@ -30,7 +30,7 @@ Most of us have committed a `.env` file at least once. vaultd exists so you can 
 
 Secrets live on disk encrypted. When you need them, they show up as ordinary environment variables in your shell. When you're done, they go away. The project directory keeps only ciphertext.
 
-<h2>
+<h2 id="description">
      <sub>
           <img src="https://cdn.simpleicons.org/git/white"
            height="25"
@@ -99,7 +99,7 @@ While unlocked you work in a shell that has your secrets. When you leave, the se
 > [!CAUTION]
 > Commit `.vaultd` to git. Keep the master password out of it, and out of everywhere else too. Forget the password and the vault is gone. There is no reset flow.
 
-<h2>
+<h2 id="supported-platforms">
      <sub>
           <img src="https://cdn.simpleicons.org/linux/white"
            height="25"
@@ -112,7 +112,7 @@ While unlocked you work in a shell that has your secrets. When you leave, the se
 
 You also need `zsh`, since the vault shell runs on `zsh -i`, and a Rust toolchain if you're building from source.
 
-<h2>
+<h2 id="installation">
      <sub>
           <img src="https://cdn.simpleicons.org/rust/white"
            height="25"
@@ -223,7 +223,7 @@ Master password changed
 
 **Each project is independent.** Unlocking uses a per-project socket, so two projects can stay unlocked side by side without commands crossing over. `lock` locks the current project only.
 
-<h2>
+<h2 id="how-it-works">
      <sub>
           <img src="https://cdn.simpleicons.org/rust/white"
            height="25"
@@ -280,7 +280,7 @@ The manifest looks like this, salt and settings are public on purpose, the passw
 > [!IMPORTANT]
 > Back up `.vaultd` somewhere safe, off that machine. Without the password it is unreadable, so losing the files is the same as losing the secrets.
 
-<h2>
+<h2 id="security">
      <sub>
           <img src="https://cdn.simpleicons.org/letsencrypt/white"
            height="25"
@@ -307,7 +307,7 @@ Since this guards real secrets, here is what it does and where it stops.
 - While the vault is unlocked, any process running as you can ask the daemon for secrets. That is how your dev server gets them too. There is no way to allow one and block the other.
 - A weak password breaks the whole thing, because the salt and settings ship with the repo and guesses can be tried offline without limits.
 
-<h2>
+<h2 id="faq">
      <sub>
           <img src="https://cdn.simpleicons.org/stackoverflow/white"
            height="25"
@@ -340,7 +340,7 @@ Normal. Git doesn't keep `0600`/`0700` modes, so files come back `0644`/`0755`. 
 
 Yes, for now. The vault shell runs on `zsh -i`. If it is missing, unlocking fails when it tries to spawn the shell.
 
-<h2>
+<h2 id="development">
      <sub>
           <img src="https://cdn.simpleicons.org/github/white"
            height="25"
@@ -372,7 +372,7 @@ Tests mirror that in `tests/`: `cli`, `crypto`, `daemon`, `storage`, `vault`, sh
 
 Changes are tracked in [CHANGELOG.md](CHANGELOG.md).
 
-<h2>
+<h2 id="acknowledgements">
      <sub>
           <img src="https://cdn.simpleicons.org/github/white"
            height="25"
@@ -383,7 +383,6 @@ Changes are tracked in [CHANGELOG.md](CHANGELOG.md).
 
 - [RustCrypto/argon2](https://github.com/RustCrypto/password-hashes) - Argon2id key derivation
 - [RustCrypto/aes-gcm](https://github.com/RustCrypto/AEADs) - AES-256-GCM authenticated encryption
-- [clap](https://github.com/clap-rs/clap) - command-line parsing
 - [rpassword](https://github.com/conradkleinespel/rpassword) - prompt without echoing
 - [zeroize](https://github.com/RustCrypto/utils) - wiping keys and secrets from memory
 
