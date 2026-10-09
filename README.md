@@ -10,8 +10,8 @@ _Encrypted vault for local dev secrets that exist only while you work._
 <a href="LICENSE"><img alt="license" src="https://custom-icon-badges.demolab.com/crates/l/vaultd?color=1C1917&logo=law&style=for-the-badge&logoColor=1C1917&labelColor=FAFAFA"></a>
 <a href="https://crates.io/crates/vaultd"><img alt="version" src="https://custom-icon-badges.demolab.com/crates/v/vaultd?color=1C1917&logo=package&style=for-the-badge&logoColor=1C1917&labelColor=FAFAFA"></a>
 <br>
-<img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux?style=for-the-badge&logo=linux&logoColor=FAFAFA&labelColor=1C1917&color=FAFAFA">
-<img alt="Built with Rust" src="https://img.shields.io/badge/built_with-Rust?style=for-the-badge&logo=rust&logoColor=FAFAFA&labelColor=1C1917&color=FAFAFA">
+<img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux?style=for-the-badge&logo=linux&logoColor=1C1917&labelColor=FAFAFA&color=1C1917">
+<img alt="Built with Rust" src="https://img.shields.io/badge/built_with-Rust?style=for-the-badge&logo=rust&logoColor=1C1917&labelColor=FAFAFA&color=1C1917">
 <a href="https://github.com/Jatinchd777/Vaultd"><img alt="stars" src="https://custom-icon-badges.demolab.com/github/stars/Jatinchd777/Vaultd?color=1C1917&logo=star&style=for-the-badge&logoColor=1C1917&labelColor=FAFAFA"></a>
 <br>
 
