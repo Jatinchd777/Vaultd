@@ -39,6 +39,33 @@ fn get_without_name_fails() {
 }
 
 #[test]
+fn each_subcommand_validates_its_args() {
+    let env = Env::new("cli-args");
+    for args in [
+        vec!["add"],
+        vec!["set"],
+        vec!["remove"],
+        vec!["set", "ONLY_NAME"],
+        // `list` and `lock` take no positional args.
+        vec!["list", "EXTRA"],
+        vec!["lock", "EXTRA"],
+    ] {
+        let out = env.run(&args, "");
+        assert!(
+            !out.status.success(),
+            "{args:?} should fail argument validation"
+        );
+    }
+}
+
+#[test]
+fn remove_without_name_fails() {
+    let env = Env::new("cli-remove-noname");
+    let out = env.run(&["remove"], "");
+    assert!(!out.status.success());
+}
+
+#[test]
 fn commands_without_daemon_fail() {
     let env = Env::new("cli-nodaemon");
     let cases: &[&[&str]] = &[

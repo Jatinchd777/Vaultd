@@ -50,6 +50,58 @@ fn unlock_corrupt_manifest_fails() {
 }
 
 #[test]
+fn unlock_corrupt_vault_fails() {
+    let env = Env::new("vault-corrupt-vault");
+    init_vault(&env, PASSWORD);
+    let vault_path = env.project.path().join(".vaultd/vault");
+    let mut bytes = std::fs::read(&vault_path).unwrap();
+    assert!(bytes.len() > 13);
+    bytes[13] ^= 0x01;
+    std::fs::write(&vault_path, &bytes).unwrap();
+    let mut session = spawn_pty(&env, &["unlock"]);
+    session.pty.read_until("Master password:", TIMEOUT);
+    session.pty.send(&format!("{PASSWORD}\n"));
+    let transcript = session
+        .pty
+        .read_until("vault authentication failed", TIMEOUT);
+    assert!(transcript.contains("vault authentication failed"));
+    let status = wait_exit(&mut session.child, TIMEOUT, "vaultd unlock");
+    assert!(!status.success());
+    assert!(!env.socket().exists());
+}
+
+#[test]
+fn unlock_invalid_salt_fails() {
+    let env = Env::new("vault-badsalt");
+    init_vault(&env, PASSWORD);
+    let manifest_path = env.project.path().join(".vaultd/manifest");
+    let mut m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    // Truncated salt decodes but has the wrong length.
+    m["kdf"]["salt"] = serde_json::Value::String("AAAA".to_string());
+    std::fs::write(&manifest_path, serde_json::to_vec(&m).unwrap()).unwrap();
+    let mut session = spawn_pty(&env, &["unlock"]);
+    session.pty.read_until("Master password:", TIMEOUT);
+    session.pty.send(&format!("{PASSWORD}\n"));
+    let status = wait_exit(&mut session.child, TIMEOUT, "vaultd unlock");
+    assert!(!status.success());
+    assert!(!env.socket().exists());
+}
+
+#[test]
+fn unlock_missing_vault_file_fails() {
+    let env = Env::new("vault-missing-file");
+    init_vault(&env, PASSWORD);
+    std::fs::remove_file(env.project.path().join(".vaultd/vault")).unwrap();
+    let mut session = spawn_pty(&env, &["unlock"]);
+    session.pty.read_until("Master password:", TIMEOUT);
+    session.pty.send(&format!("{PASSWORD}\n"));
+    let status = wait_exit(&mut session.child, TIMEOUT, "vaultd unlock");
+    assert!(!status.success());
+    assert!(!env.socket().exists());
+}
+
+#[test]
 fn full_session_roundtrip() {
     if !have_zsh() {
         eprintln!("skipping: zsh is required for the vault shell");
@@ -272,4 +324,150 @@ fn projects_are_isolated_with_shared_runtime() {
         Duration::from_secs(30),
         "unlock B shell",
     );
+}
+
+#[test]
+fn session_persistence_and_empty_list() {
+    if !have_zsh() {
+        eprintln!("skipping: zsh is required for the vault shell");
+        return;
+    }
+    let env = Env::new("vault-persist");
+    init_vault(&env, PASSWORD);
+
+    let mut shell = spawn_pty(&env, &["unlock"]);
+    shell.pty.read_until("Master password:", TIMEOUT);
+    shell.pty.send(&format!("{PASSWORD}\n"));
+    shell.pty.read_until("Vault unlocked", TIMEOUT);
+    env.wait_for_socket(Duration::from_secs(30));
+
+    // Fresh vault lists as empty.
+    let out = env.run(&["list"], "");
+    assert!(out.status.success());
+    assert!(
+        stdout(&out).contains("No credentials"),
+        "unexpected list output: {}",
+        stdout(&out)
+    );
+
+    // `set` without an inline value prompts, like `add` does.
+    let out = env.run(&["add", "PERSIST", "v1"], "");
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let mut set = spawn_pty(&env, &["set", "PERSIST"]);
+    set.pty.read_until("Credential value:", TIMEOUT);
+    set.pty.send("v2\n");
+    let transcript = set.pty.read_until("Credential updated", TIMEOUT);
+    assert!(transcript.contains("Credential updated: PERSIST"));
+    assert!(wait_exit(&mut set.child, TIMEOUT, "vaultd set").success());
+    assert_eq!(stdout(&env.run(&["get", "PERSIST"], "")).trim_end(), "v2");
+
+    // Lock, unlock again with the same password: secrets persist.
+    assert!(env.run(&["lock"], "").status.success());
+    env.wait_for_gone(&env.socket(), Duration::from_secs(10));
+    shell.pty.send("exit\n");
+    let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
+
+    let mut shell2 = spawn_pty(&env, &["unlock"]);
+    shell2.pty.read_until("Master password:", TIMEOUT);
+    shell2.pty.send(&format!("{PASSWORD}\n"));
+    shell2.pty.read_until("Vault unlocked", TIMEOUT);
+    env.wait_for_socket(Duration::from_secs(30));
+    assert_eq!(stdout(&env.run(&["get", "PERSIST"], "")).trim_end(), "v2");
+
+    // Second lock succeeds; a further lock with no daemon fails.
+    assert!(env.run(&["lock"], "").status.success());
+    env.wait_for_gone(&env.socket(), Duration::from_secs(10));
+    let out = env.run(&["lock"], "");
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("vaultd daemon is not running"),
+        "unexpected stderr: {}",
+        stderr(&out)
+    );
+    shell2.pty.send("exit\n");
+    let _ = wait_exit(&mut shell2.child, Duration::from_secs(30), "vaultd unlock");
+}
+
+#[test]
+fn env_export_format_and_escaping() {
+    if !have_zsh() {
+        eprintln!("skipping: zsh is required for the vault shell");
+        return;
+    }
+    let env = Env::new("vault-env-fmt");
+    init_vault(&env, PASSWORD);
+    let mut shell = spawn_pty(&env, &["unlock"]);
+    shell.pty.read_until("Master password:", TIMEOUT);
+    shell.pty.send(&format!("{PASSWORD}\n"));
+    shell.pty.read_until("Vault unlocked", TIMEOUT);
+    env.wait_for_socket(Duration::from_secs(30));
+
+    assert!(env.run(&["add", "PLAIN", "secret-1"], "").status.success());
+    assert!(
+        env.run(&["add", "TRICKY", "a'b \"c\" $d"], "")
+            .status
+            .success()
+    );
+
+    let out = env.run(&["__env"], "");
+    assert!(out.status.success(), "__env failed: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("export VAULTD_SOCKET="), "missing socket:\n{text}");
+    assert!(text.contains("export VAULTD_TOKEN="), "missing token:\n{text}");
+    assert!(text.contains("export PLAIN='secret-1'"), "missing plain:\n{text}");
+    // Single quotes in values must be shell-escaped as '\''.
+    assert!(
+        text.contains("export TRICKY='a'\\''b \"c\" $d'"),
+        "bad escaping:\n{text}"
+    );
+    assert!(text.contains("_VAULTD_EXPORTED="), "missing export list:\n{text}");
+    assert!(text.contains("vaultd-clear()"), "missing clear fn:\n{text}");
+    // Token is 64 hex chars.
+    let token_line = text
+        .lines()
+        .find(|l| l.starts_with("export VAULTD_TOKEN="))
+        .expect("token line");
+    let token_val = token_line
+        .split('=')
+        .nth(1)
+        .unwrap()
+        .trim_matches('\'');
+    assert_eq!(token_val.len(), 64);
+    assert!(token_val.chars().all(|c| c.is_ascii_hexdigit()));
+
+    let _ = env.run(&["lock"], "");
+    env.wait_for_gone(&env.socket(), Duration::from_secs(10));
+    shell.pty.send("exit\n");
+    let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
+}
+
+#[test]
+fn env_rejects_invalid_name() {
+    if !have_zsh() {
+        eprintln!("skipping: zsh is required for the vault shell");
+        return;
+    }
+    let env = Env::new("vault-env-badname");
+    init_vault(&env, PASSWORD);
+    let mut shell = spawn_pty(&env, &["unlock"]);
+    shell.pty.read_until("Master password:", TIMEOUT);
+    shell.pty.send(&format!("{PASSWORD}\n"));
+    shell.pty.read_until("Vault unlocked", TIMEOUT);
+    env.wait_for_socket(Duration::from_secs(30));
+
+    // `add` currently accepts any string; `__env` must refuse to emit it
+    // as shell code.
+    assert!(env.run(&["add", "BAD-NAME", "x"], "").status.success());
+    let out = env.run(&["__env"], "");
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("invalid environment variable name"),
+        "unexpected stderr: {}",
+        stderr(&out)
+    );
+
+    let _ = env.run(&["lock"], "");
+    env.wait_for_gone(&env.socket(), Duration::from_secs(10));
+    shell.pty.send("exit\n");
+    let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
 }

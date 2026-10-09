@@ -99,3 +99,104 @@ fn second_init_refuses_to_overwrite() {
     // The existing vault is untouched.
     assert_eq!(vault_bytes(&env), before);
 }
+
+// --- Direct unit tests for `src/crypto` (no vault on disk) ---
+
+#[test]
+fn cipher_roundtrip() {
+    use vaultd::crypto::cipher;
+    let key = [0x42u8; 32];
+    for plaintext in [b"".as_slice(), b"[]", b"{\"a\":1}", &[0u8; 1024]] {
+        let encrypted = cipher::encrypt(&key, plaintext).expect("encrypt");
+        // 12-byte nonce + plaintext + 16-byte GCM tag.
+        assert_eq!(encrypted.len(), 12 + plaintext.len() + 16);
+        assert_eq!(cipher::decrypt(&key, &encrypted).unwrap(), plaintext);
+    }
+}
+
+#[test]
+fn cipher_nonce_is_fresh() {
+    use vaultd::crypto::cipher;
+    let key = [0x11u8; 32];
+    let a = cipher::encrypt(&key, b"same").unwrap();
+    let b = cipher::encrypt(&key, b"same").unwrap();
+    assert_ne!(a, b, "each encryption must use a fresh random nonce");
+    // Nonces themselves differ.
+    assert_ne!(&a[..12], &b[..12]);
+}
+
+#[test]
+fn cipher_tamper_is_detected() {
+    use vaultd::crypto::cipher;
+    let key = [0x77u8; 32];
+    let mut encrypted = cipher::encrypt(&key, b"secret").unwrap();
+    let last = encrypted.len() - 1;
+    encrypted[last] ^= 0x01;
+    let err = cipher::decrypt(&key, &encrypted).unwrap_err();
+    assert!(
+        err.to_string().contains("authentication failed"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn cipher_wrong_key_fails() {
+    use vaultd::crypto::cipher;
+    let encrypted = cipher::encrypt(&[1u8; 32], b"data").unwrap();
+    let err = cipher::decrypt(&[2u8; 32], &encrypted).unwrap_err();
+    assert!(
+        err.to_string().contains("authentication failed"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn cipher_short_input_fails() {
+    use vaultd::crypto::cipher;
+    let err = cipher::decrypt(&[0u8; 32], &[0u8; 11]).unwrap_err();
+    assert!(
+        err.to_string().contains("too short"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn kdf_generate_gives_fresh_salt_and_defaults() {
+    use vaultd::crypto::kdf::KdfParams;
+    let a = KdfParams::generate().unwrap();
+    let b = KdfParams::generate().unwrap();
+    assert_ne!(a.salt, b.salt, "salts must be random");
+    for p in [&a, &b] {
+        assert_eq!(p.memory_cost, 19_456);
+        assert_eq!(p.time_cost, 2);
+        assert_eq!(p.parallelism, 1);
+    }
+}
+
+#[test]
+fn kdf_is_deterministic_for_same_inputs() {
+    use vaultd::crypto::kdf::{self, KdfParams};
+    let params = KdfParams {
+        salt: [9u8; 16],
+        memory_cost: 19_456,
+        time_cost: 2,
+        parallelism: 1,
+    };
+    let k1 = kdf::derive_key(b"password", &params).unwrap();
+    let k2 = kdf::derive_key(b"password", &params).unwrap();
+    assert_eq!(k1, k2);
+    assert_eq!(k1.len(), 32);
+    // Different password and different salt change the key.
+    assert_ne!(k1, kdf::derive_key(b"other", &params).unwrap());
+    let other_salt = params_with_salt([10u8; 16]);
+    assert_ne!(k1, kdf::derive_key(b"password", &other_salt).unwrap());
+}
+
+fn params_with_salt(salt: [u8; 16]) -> vaultd::crypto::kdf::KdfParams {
+    vaultd::crypto::kdf::KdfParams {
+        salt,
+        memory_cost: 19_456,
+        time_cost: 2,
+        parallelism: 1,
+    }
+}

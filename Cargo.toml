@@ -3,6 +3,20 @@ name = "vaultd"
 version = "0.1.0-beta.1"
 edition = "2024"
 
+[lib]
+name = "vaultd"
+path = "src/lib.rs"
+# Single test target: unit/doc scaffolds in src/ hold no tests —
+# everything lives in tests/main.rs. Disabling them keeps `cargo test`
+# to one runner with one summary line.
+test = false
+doctest = false
+
+[[bin]]
+name = "vaultd"
+path = "src/main.rs"
+test = false
+
 [dependencies]
 anyhow = "1"
 argon2 = "0.5"

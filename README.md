@@ -97,8 +97,8 @@ Unlocking works like this:
 
 1. Your password goes through Argon2id with the salt and settings from the manifest. Out comes the key.
 2. The key decrypts the vault file. The encryption is authenticated, so a wrong password looks exactly like a damaged file. Either way you get an error and nothing else.
-3. A background daemon holds the decrypted vault in memory. It listens on a per-project Unix socket under `$XDG_RUNTIME_DIR/vaultd` that only your user can connect to, so one project's commands never reach another project's daemon. Past this point the `vaultd` commands never see keys or ciphertext themselves, they just ask the daemon over that socket.
-4. Your shell gets the credentials as environment variables. When you exit the shell, or run `vaultd lock`, the daemon clears its memory, removes the socket, and stops.
+3. A background daemon holds the decrypted vault in memory. It listens on a per-project Unix socket under `$XDG_RUNTIME_DIR/vaultd` that only your user can connect to, so one project's commands never reach another project's daemon. Every request must also present the unlock session token (`VAULTD_TOKEN`, stored as `vaultd-<hash>.token` next to the socket), and the daemon checks the peer UID, so only that session can read or modify secrets. Past this point the `vaultd` commands never see keys or ciphertext themselves, they just ask the daemon over that socket.
+4. Your shell gets the credentials as environment variables. When you exit the shell, or run `vaultd lock`, the daemon clears its memory, removes the socket and token, and stops.
 
 Each `add`, `set`, and `remove` encrypts the full set of credentials again with a new random nonce before writing. The file on disk never holds old plaintext and never repeats encryption randomness.
 
@@ -113,6 +113,8 @@ The key comes from Argon2id with a random salt made at `init` time. Deriving it 
 The password itself is never written anywhere. It is only in memory for the moment it takes to derive the key. That is why forgetting it is final.
 
 Committing `.vaultd` is safe because all an attacker gets is ciphertext, a salt, and derivation settings. The salt and settings are public on purpose. The password is the whole defense against offline guessing, so it should be a generated passphrase, not a word you picked.
+
+The vault directory is `0700` and both files are `0600`, created under `umask 077`, so other local users never get the ciphertext in the first place. Git does not preserve those modes, so after a clone the files may come back `0755`/`0644` — vaultd tightens them back on every read and write. Symlinked `.vaultd` directories and `manifest`/`vault` files are refused rather than followed, and `$VAULTD_SOCKET` values pointing outside `$XDG_RUNTIME_DIR/vaultd` are rejected.
 
 On lock, the daemon zeroes the key and the decrypted secrets. That shrinks how long they sit in RAM. It cannot pull back copies your shell, scrollback, or child processes already hold.
 
@@ -138,9 +140,10 @@ Back up `.vaultd` somewhere safe, off that machine. Without the password it is u
 cargo build
 cargo run -- --help
 cargo run -- <command> --help
+cargo test   # one runner, tests/main.rs (50 tests)
 ```
 
-The code is split the way the system is: `cli` declares the commands, `commands` carries them out, `crypto` does key derivation and encryption, `storage` handles the `.vaultd` files, `vault` handles unlocking and the in-memory secrets, `daemon` handles the IPC protocol and the unlock session.
+The code is split the way the system is: `cli` declares the commands, `commands` carries them out, `crypto` does key derivation and encryption, `storage` handles the `.vaultd` files, `vault` handles unlocking and the in-memory secrets, `daemon` handles the IPC protocol and the unlock session. Tests mirror that in `tests/`: `cli`, `crypto`, `daemon`, `storage`, `vault`, sharing the `common` harness that drives the real binary in isolated temp projects.
 
 ## License
 

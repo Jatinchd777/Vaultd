@@ -6,4 +6,6 @@
 mod cli;
 mod common;
 mod crypto;
+mod daemon;
+mod storage;
 mod vault;
