@@ -4,13 +4,13 @@
 
 _Encrypted vault for local dev secrets that exist only while you work._
 <br>
-<sub>(pronounced: vault-ied)</sub>
+<sub>(pronounced: vaultied)</sub>
 <br><br>
 
 <a href="LICENSE"><img alt="license" src="https://custom-icon-badges.demolab.com/crates/l/vaultd?color=1C1917&logo=law&style=for-the-badge&logoColor=1C1917&labelColor=FAFAFA"></a>
 <a href="https://crates.io/crates/vaultd"><img alt="version" src="https://custom-icon-badges.demolab.com/crates/v/vaultd?color=1C1917&logo=package&style=for-the-badge&logoColor=1C1917&labelColor=FAFAFA"></a>
 <br>
-<img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux?style=for-the-badge&logo=linux&logoColor=1C1917&labelColor=FAFAFA&color=1C1917">
+<img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux?style=for-the-badge&labelColor=FAFAFA&color=1C1917">
 <a href="https://github.com/Jatinchd777/Vaultd"><img alt="stars" src="https://custom-icon-badges.demolab.com/github/stars/Jatinchd777/Vaultd?color=1C1917&logo=star&style=for-the-badge&logoColor=1C1917&labelColor=FAFAFA"></a>
 <br>
 
@@ -353,7 +353,7 @@ Yes, for now. The vault shell runs on `zsh -i`. If it is missing, unlocking fail
 cargo build
 cargo run -- --help
 cargo run -- <command> --help
-cargo test   # one runner, tests/main.rs (50 tests)
+cargo test   # one runner, tests/main.rs
 ```
 
 The code is split the way the system is:
