@@ -4,9 +4,9 @@
 
 _Encrypted vault for local dev secrets that exist only while you work._
 
-[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
-![Built with Rust](https://img.shields.io/badge/built_with-Rust-orange?style=flat-square&logo=rust)
-![Platform: Linux](https://img.shields.io/badge/platform-Linux-yellow?style=flat-square&logo=linux)
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square" alt="License: GPL-3.0"></a>
+<img src="https://img.shields.io/badge/built_with-Rust-orange?style=flat-square&logo=rust" alt="Built with Rust">
+<img src="https://img.shields.io/badge/platform-Linux-yellow?style=flat-square&logo=linux" alt="Platform: Linux">
 
 [Quick start](#quick-start) · [Installation](#installation) · [Usage](#usage) · [How it works](#how-it-works) · [Security](#security)
 
