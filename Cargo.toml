@@ -2,6 +2,13 @@
 name = "vaultd"
 version = "0.3.0-beta"
 edition = "2024"
+description = "Encrypted secrets for local development that work like `.env`"
+license = "GPL-3.0-only"
+repository = "https://github.com/Jatinchd777/Vaultd"
+readme = "README.md"
+keywords = ["secrets", "dotenv", "vault", "password-manager", "cli"]
+categories = ["command-line-utilities"]
+exclude = [".vaultd/"]
 
 [lib]
 name = "vaultd"
