@@ -46,6 +46,14 @@ Commit `.vaultd` to git. Keep the master password out of it, and out of everywhe
 ## Installation
 
 ```sh
+cargo install vaultd
+```
+
+That pulls the release from crates.io and puts the binary in `$HOME/.cargo/bin`. Make sure that directory is on your `PATH`.
+
+Or with the installer script:
+
+```sh
 curl -fsSL https://raw.githubusercontent.com/Jatinchd777/Vaultd/main/install.sh | sh
 ```
 
@@ -64,7 +72,7 @@ You need a Rust toolchain, Linux, and `zsh`, since the vault shell runs on `zsh`
 
 ## Usage
 
-Run these from anywhere inside the project — vaultd finds `.vaultd` by walking up. Except for `init` and `passwd` (which work while locked), every command needs an unlocked vault, so `unlock` comes first.
+Run these from anywhere inside the project, vaultd finds `.vaultd` by walking up. Except for `init` and `passwd` (which work while locked), every command needs an unlocked vault, so `unlock` comes first.
 
 | Command | What it does |
 |---|---|
@@ -82,7 +90,7 @@ Run these from anywhere inside the project — vaultd finds `.vaultd` by walking
 
 Skip `VALUE` and vaultd will ask for it without echoing. That is the better habit. Typed inline, a secret lands in shell history and shows up in the process list while the command runs.
 
-`passwd` never takes a password on the command line. It asks for the current password, then the new one twice, with no echo — same as `init`. It re-encrypts everything under a fresh salt, so the old password stops working. If the vault is unlocked, `lock` first.
+`passwd` never takes a password on the command line. It asks for the current password, then the new one twice, with no echo, same as `init`. It re-encrypts everything under a fresh salt, so the old password stops working. If the vault is unlocked, `lock` first.
 
 ## How it works
 
@@ -117,7 +125,7 @@ The password itself is never written anywhere. It is only in memory for the mome
 
 Committing `.vaultd` is safe because all an attacker gets is ciphertext, a salt, and derivation settings. The salt and settings are public on purpose. The password is the whole defense against offline guessing, so it should be a generated passphrase, not a word you picked.
 
-The vault directory is `0700` and both files are `0600`, created under `umask 077`, so other local users never get the ciphertext in the first place. Git does not preserve those modes, so after a clone the files may come back `0755`/`0644` — vaultd tightens them back on every read and write. Symlinked `.vaultd` directories and `manifest`/`vault` files are refused rather than followed, and `$VAULTD_SOCKET` values pointing outside `$XDG_RUNTIME_DIR/vaultd` are rejected.
+The vault directory is `0700` and both files are `0600`, created under `umask 077`, so other local users never get the ciphertext in the first place. Git does not preserve those modes, so after a clone the files may come back `0755`/`0644`, vaultd tightens them back on every read and write. Symlinked `.vaultd` directories and `manifest`/`vault` files are refused rather than followed, and `$VAULTD_SOCKET` values pointing outside `$XDG_RUNTIME_DIR/vaultd` are rejected.
 
 On lock, the daemon zeroes the key and the decrypted secrets. That shrinks how long they sit in RAM. It cannot pull back copies your shell, scrollback, or child processes already hold.
 
