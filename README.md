@@ -2,7 +2,7 @@
 
 # vaultd
 
-_Encrypted secrets for local development that work like `.env`._
+_Encrypted vault for local dev secrets that exist only while you work._
 
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
 ![Built with Rust](https://img.shields.io/badge/built_with-Rust-orange?style=flat-square&logo=rust)

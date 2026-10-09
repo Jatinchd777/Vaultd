@@ -2,7 +2,7 @@
 name = "vaultd"
 version = "0.3.0"
 edition = "2024"
-description = "Encrypted secrets for local development that work like `.env`"
+description = "Encrypted vault for local dev secrets that exist only while you work."
 license = "GPL-3.0-only"
 repository = "https://github.com/Jatinchd777/Vaultd"
 readme = "README.md"
