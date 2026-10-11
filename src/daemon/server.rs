@@ -12,6 +12,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
+    time::Instant,
 };
 
 use anyhow::Result;
@@ -599,12 +600,31 @@ fn daemon_main(
     }
 
     let vault = Arc::new(Mutex::new(vault));
-    let _reason = serve_loop(&listener, Arc::clone(&vault), pidfd, expected_token)?;
+    let reason = match serve_loop(&listener, Arc::clone(&vault), pidfd, expected_token) {
+        Ok(reason) => reason,
+        Err(error) => {
+            drop(listener);
+            drop(vault);
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(&token_path);
+            // Daemon is going away unexpectedly: don't leave the vault
+            // shell orphaned with secrets in its environment.
+            terminate_vault_shell(pidfd);
+            return Err(error);
+        }
+    };
 
     drop(listener);
     drop(vault);
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(&token_path);
+
+    if reason == ShutdownReason::LockRequested {
+        // `Lock` stopped the daemon but the vault shell (watched via
+        // pidfd) would otherwise survive with secrets still exported.
+        // End it so `lock` really locks.
+        terminate_vault_shell(pidfd);
+    }
 
     Ok(())
 }
@@ -842,6 +862,78 @@ fn pidfd_open(pid: libc::pid_t) -> Result<RawFd> {
     }
 
     Ok(fd as RawFd)
+}
+
+/// Best-effort signal to the vault shell via its pidfd.
+/// Uses the raw `pidfd_send_signal` syscall so the exact shell watched
+/// since `fork` is signaled; no PID-reuse race. Errors (notably `ESRCH`
+/// when the shell already exited) are ignored by design.
+fn pidfd_send_signal(pidfd: RawFd, sig: libc::c_int) {
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal as libc::c_long,
+            pidfd as libc::c_int,
+            sig as libc::c_int,
+            std::ptr::null::<libc::c_void>(),
+            0 as libc::c_int,
+        );
+    }
+}
+
+/// Non-blocking check: `true` once the pidfd's process has exited.
+fn pidfd_has_exited(pidfd: RawFd) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+    ret > 0 && (pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0)
+}
+
+/// Block up to `timeout` for the pidfd's process to exit.
+fn wait_pidfd_exit(pidfd: RawFd, timeout: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if pidfd_has_exited(pidfd) {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return pidfd_has_exited(pidfd);
+        }
+        let mut pfd = libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if ret > 0 && (pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0) {
+            return true;
+        }
+    }
+}
+
+/// End the vault shell after `Lock` (or an unexpected daemon failure).
+/// Interactive `bash`/`zsh` ignore `SIGTERM` but die on `SIGHUP`;
+/// `fish` ignores both, so fall back to `SIGKILL`. Best-effort: a shell
+/// that already exited is the common case for the `ShellExited` path.
+fn terminate_vault_shell(pidfd: RawFd) {
+    if pidfd_has_exited(pidfd) {
+        return;
+    }
+    pidfd_send_signal(pidfd, libc::SIGHUP);
+    if wait_pidfd_exit(pidfd, Duration::from_millis(1000)) {
+        return;
+    }
+    pidfd_send_signal(pidfd, libc::SIGKILL);
+    let _ = wait_pidfd_exit(pidfd, Duration::from_millis(1000));
 }
 
 fn write_byte(fd: RawFd, byte: u8) -> Result<()> {

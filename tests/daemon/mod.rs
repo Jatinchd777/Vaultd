@@ -364,8 +364,49 @@ fn second_unlock_while_running_fails() {
     let out = env.run(&["lock"], "");
     assert!(out.status.success(), "lock failed: {}", stderr(&out));
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
-    shell.pty.send("exit\n");
+    // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
+}
+
+#[test]
+fn lock_terminates_vault_shell() {
+    if !have_zsh() {
+        eprintln!("skipping: zsh is required for the vault shell");
+        return;
+    }
+    let env = Env::new("daemon-lock-kills-shell");
+    init_vault(&env, PASSWORD);
+    let mut shell = spawn_pty(&env, &["unlock"]);
+    shell.pty.read_until("Master password:", TIMEOUT);
+    shell.pty.send(&format!("{PASSWORD}\n"));
+    shell.pty.read_until("Vault unlocked", TIMEOUT);
+    env.wait_for_socket(Duration::from_secs(30));
+
+    // Shell owns the session: still alive before `lock`.
+    assert!(
+        shell.child.try_wait().expect("try_wait").is_none(),
+        "vault shell exited before lock"
+    );
+
+    let out = env.run(&["lock"], "");
+    assert!(out.status.success(), "lock failed: {}", stderr(&out));
+    env.wait_for_gone(&env.socket(), Duration::from_secs(10));
+
+    // Regression: the daemon alone must not survive while the shell
+    // lingers with secrets in its environment. `lock` ends the shell.
+    let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
+    assert!(
+        shell.child.try_wait().expect("try_wait").is_some(),
+        "lock left the vault shell running"
+    );
+    // Daemon is gone too: further commands fail fast.
+    let out = env.run(&["list"], "");
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("vaultd daemon is not running"),
+        "unexpected stderr: {}",
+        stderr(&out)
+    );
 }
 
 #[test]
@@ -408,7 +449,7 @@ fn wrong_token_is_rejected() {
 
     let _ = env.run(&["lock"], "");
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
-    shell.pty.send("exit\n");
+    // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
 }
 
@@ -454,7 +495,7 @@ fn slow_loris_does_not_block_others() {
 
     let _ = env.run(&["lock"], "");
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
-    shell.pty.send("exit\n");
+    // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
 }
 
@@ -530,7 +571,7 @@ fn oversized_request_is_rejected_without_hang() {
 
     let _ = env.run(&["lock"], "");
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
-    shell.pty.send("exit\n");
+    // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
 }
 
@@ -569,7 +610,7 @@ fn concurrent_adds_all_succeed() {
 
     let _ = env.run(&["lock"], "");
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
-    shell.pty.send("exit\n");
+    // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
 }
 
@@ -607,7 +648,7 @@ fn bash_shell_roundtrip() {
 
     let _ = env.run(&["lock"], "");
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
-    shell.pty.send("exit\n");
+    // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
 }
 
@@ -668,7 +709,7 @@ fn fish_shell_roundtrip() {
 
     let _ = env.run(&["lock"], "");
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
-    shell.pty.send("exit\n");
+    // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
 }
 
@@ -739,6 +780,6 @@ fn env_shell_flag_emits_per_shell_syntax() {
 
     let _ = env.run(&["lock"], "");
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
-    shell.pty.send("exit\n");
+    // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
 }

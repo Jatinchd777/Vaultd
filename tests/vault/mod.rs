@@ -148,7 +148,7 @@ fn weak_vault_still_unlocks() {
 
     let _ = env.run(&["lock"], "");
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
-    shell.pty.send("exit\n");
+    // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
 }
 
@@ -227,9 +227,9 @@ fn full_session_roundtrip() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("vaultd daemon is not running"));
 
-    shell.pty.send("exit\n");
-    let status = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
-    assert!(status.success(), "unlock exited with {status}");
+    // `lock` terminates the vault shell on its own; it dies by signal so
+    // any exit status (not necessarily success) counts, only that it exits.
+    let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
 }
 
 #[test]
@@ -358,18 +358,28 @@ fn projects_are_isolated_with_shared_runtime() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("vaultd daemon is not running"));
 
-    // Cleanup: lock B, then both shells exit cleanly.
-    let out = run_in(proj_b.path(), runtime.path(), home.path(), &["lock"]);
-    assert!(out.status.success());
-    wait_for_gone_path(&sock_b, Duration::from_secs(10));
-
-    shell_a.pty.send("exit\n");
-    shell_b.pty.send("exit\n");
+    // Locking A terminates shell A but must leave B's session alone.
+    // `lock` removes the socket first, then signals the shell, so allow a
+    // beat for the shell to die.
     let _ = wait_exit(
         &mut shell_a.child,
         Duration::from_secs(30),
         "unlock A shell",
     );
+    assert!(
+        shell_a.child.try_wait().expect("try_wait A").is_some(),
+        "locking A must terminate shell A"
+    );
+    assert!(
+        shell_b.child.try_wait().expect("try_wait B").is_none(),
+        "locking A must not kill shell B"
+    );
+
+    // Cleanup: lock B terminates shell B as well.
+    let out = run_in(proj_b.path(), runtime.path(), home.path(), &["lock"]);
+    assert!(out.status.success());
+    wait_for_gone_path(&sock_b, Duration::from_secs(10));
+
     let _ = wait_exit(
         &mut shell_b.child,
         Duration::from_secs(30),
@@ -413,9 +423,9 @@ fn session_persistence_and_empty_list() {
     assert_eq!(stdout(&env.run(&["get", "PERSIST"], "")).trim_end(), "v2");
 
     // Lock, unlock again with the same password: secrets persist.
+    // `lock` terminates the vault shell itself (no manual `exit`).
     assert!(env.run(&["lock"], "").status.success());
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
-    shell.pty.send("exit\n");
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
 
     let mut shell2 = spawn_pty(&env, &["unlock"]);
@@ -435,7 +445,6 @@ fn session_persistence_and_empty_list() {
         "unexpected stderr: {}",
         stderr(&out)
     );
-    shell2.pty.send("exit\n");
     let _ = wait_exit(&mut shell2.child, Duration::from_secs(30), "vaultd unlock");
 }
 
@@ -494,7 +503,7 @@ fn env_export_format_and_escaping() {
 
     let _ = env.run(&["lock"], "");
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
-    shell.pty.send("exit\n");
+    // `lock` terminates the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
 }
 
@@ -525,6 +534,6 @@ fn env_rejects_invalid_name() {
 
     let _ = env.run(&["lock"], "");
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
-    shell.pty.send("exit\n");
+    // `lock` terminates the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
 }
