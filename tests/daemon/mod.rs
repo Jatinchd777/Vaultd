@@ -410,6 +410,54 @@ fn lock_terminates_vault_shell() {
 }
 
 #[test]
+fn lock_from_inside_exits_shell_cleanly() {
+    // `lock` driven from inside the vault shell must end the session
+    // via the shell's own auto-lock hook: exit by status, never death
+    // by signal (no `killed` report from the outer shell).
+    let bin = crate::common::binary();
+    let bin = bin.to_string_lossy().into_owned();
+    for shell in ["zsh", "bash", "fish"] {
+        let have = match shell {
+            "zsh" => have_zsh(),
+            "bash" => have_bash(),
+            "fish" => have_fish(),
+            _ => false,
+        };
+        if !have {
+            eprintln!("skipping: {shell} is required for the vault shell");
+            continue;
+        }
+        let env = Env::new(&format!("daemon-inside-lock-{shell}"));
+        init_vault(&env, PASSWORD);
+        let mut vault_shell = spawn_pty_with_extra(&env, &["unlock"], &[("VAULTD_SHELL", shell)]);
+        vault_shell.pty.read_until("Master password:", TIMEOUT);
+        vault_shell.pty.send(&format!("{PASSWORD}\n"));
+        vault_shell.pty.read_until("Vault unlocked", TIMEOUT);
+        env.wait_for_socket(Duration::from_secs(30));
+
+        vault_shell.pty.send(&format!("{bin} lock\n"));
+        let transcript = vault_shell
+            .pty
+            .read_until("Vault locked", Duration::from_secs(30));
+        assert!(
+            transcript.contains("Vault locked"),
+            "{shell}: inside lock failed:\n{transcript}"
+        );
+
+        let status = wait_exit(
+            &mut vault_shell.child,
+            Duration::from_secs(30),
+            "vault shell after inside lock",
+        );
+        assert!(
+            status.success(),
+            "{shell}: vault shell did not exit cleanly: {status}"
+        );
+        env.wait_for_gone(&env.socket(), Duration::from_secs(10));
+    }
+}
+
+#[test]
 fn wrong_token_is_rejected() {
     if !have_zsh() {
         eprintln!("skipping: zsh is required for the vault shell");
@@ -750,6 +798,10 @@ fn env_shell_flag_emits_per_shell_syntax() {
         "missing fish secret:\n{fish_text}"
     );
     assert!(
+        fish_text.contains("function _vaultd_autolock --on-event fish_prompt"),
+        "missing fish auto-lock hook:\n{fish_text}"
+    );
+    assert!(
         !fish_text.contains("export "),
         "fish output must not use export:\n{fish_text}"
     );
@@ -766,8 +818,26 @@ fn env_shell_flag_emits_per_shell_syntax() {
         "missing bash secret:\n{bash_text}"
     );
     assert!(
+        bash_text.contains("PROMPT_COMMAND=") && bash_text.contains("_vaultd_autolock"),
+        "missing bash auto-lock hook:\n{bash_text}"
+    );
+    assert!(
         !bash_text.contains("set -gx"),
         "bash output must not use set -gx:\n{bash_text}"
+    );
+
+    // zsh hooks travel via the generated `ZDOTDIR` init (functions die
+    // at `exec`), so `__env` emits none for zsh.
+    let out = env.run(&["__env", "--shell", "zsh"], "");
+    assert!(
+        out.status.success(),
+        "__env --shell zsh failed: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stdout(&out).contains("_vaultd_autolock"),
+        "zsh hook must not come from __env:\n{}",
+        stdout(&out)
     );
 
     let out = env.run(&["__env", "--shell", "tcsh"], "");

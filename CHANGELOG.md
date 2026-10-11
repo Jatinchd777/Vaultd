@@ -1,21 +1,60 @@
 # Changelog
 
 All notable changes to vaultd are documented here. Entries mirror the
-GitHub releases (`v0.1.0` … `vx.x.x`); the top section tracks work not
+GitHub releases (`v0.1.0` … `v0.4.3`); the top section tracks work not
 yet released.
+
+## [v0.4.4]
+
+### Fixed
+- `vaultd lock` stopped only the daemon and left the vault shell
+  behind with secrets still exported. `lock` now ends the shell it
+  opened, and the shell exits cleanly by itself at its next prompt via a
+  new auto-lock hook (`PROMPT_COMMAND` for `bash`, `precmd` hook via
+  generated `ZDOTDIR` init for `zsh`, `fish_prompt` event for `fish`),
+  and the daemon keeps a `SIGKILL` backstop via its held `pidfd`
+  (`src/daemon/server.rs`, `src/commands/env.rs`) — no PID-reuse
+  race. No more `killed` report on `lock` from inside.
+- `vaultd lock` returns only after the socket is actually gone, so
+  the shell's next prompt always observes the locked state
+  (`src/commands/lock.rs`).
+- Per-project isolation unchanged: locking A ends shell A only.
+- Tests: new `lock_terminates_vault_shell` and
+  `lock_from_inside_exits_shell_cleanly` (clean exit on all three
+  shells); all `lock` cleanups assert auto-exit with no manual
+  `exit`; suite 66 -> 68.
+
+No protocol change, existing sessions stay compatible.
 
 ## [v0.4.3]
 
-### Fixed
-- `vaultd lock` now terminates the vault shell it opened instead of
-  stopping only the daemon (`src/daemon/server.rs`): the daemon
-  signals the shell via its held `pidfd` (`SIGHUP`, wait `1s`, then
-  `SIGKILL` fallback — interactive `bash`/`zsh` ignore `SIGTERM`,
-  `fish` ignores both). Socket/token removal and vault drop happen
-  first, so secrets are unreachable before the shell dies. Locking
-  one project kills only its own shell.
+### Summary
+
+Lock ends the session: `vaultd lock` now terminates the vault shell
+it opened, instead of stopping the daemon and leaving the shell
+behind with secrets still exported.
+
+### Changes
+
+- Daemon signals the vault shell via its held `pidfd`
+  (`src/daemon/server.rs`): `SIGHUP`, wait `1s`, then `SIGKILL`
+  fallback — interactive `bash`/`zsh` ignore `SIGTERM`, `fish`
+  ignores both, so `TERM`-only never worked
+
+- `pidfd_send_signal` targets the exact shell watched since `fork`;
+  no PID-reuse race, `ESRCH` (already exited) ignored by design
+
+- Socket/token removal and vault drop happen first, shell kill
+  after, so secrets are unreachable before the shell dies
+
+- Per-project isolation preserved: locking A kills shell A only,
+  shell B stays up (`tests/vault/mod.rs`)
+
+- Unexpected daemon failure also ends the shell instead of
+  orphaning it with secrets in its environment
+
 - Tests: new `lock_terminates_vault_shell` plus all `lock` cleanups
-  now assert auto-exit with no manual `exit`; suite 66 -> 67.
+  now assert auto-exit with no manual `exit`; suite 66 -> 67
 
 No protocol change, existing sessions stay compatible. Lock and
 unlock once after updating.

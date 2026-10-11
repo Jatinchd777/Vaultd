@@ -23,6 +23,27 @@ pub fn run(shell: Option<String>) -> Result<()> {
         emit(name, value, fish);
     }
 
+    // Auto-lock hook: a vault shell sitting at its prompt exits cleanly
+    // by itself once the daemon socket is gone, so `lock` from inside
+    // returns to the outer shell with no `killed` report. (zsh travels
+    // via the generated `ZDOTDIR` init instead: functions die at `exec`.)
+    match shell {
+        server::Shell::Bash => {
+            println!("_vaultd_autolock() {{ [ -S \"${{VAULTD_SOCKET:-}}\" ] || exit 0; }}");
+            println!("export -f _vaultd_autolock 2>/dev/null || true");
+            println!(
+                "if [ -n \"${{PROMPT_COMMAND:-}}\" ]; then PROMPT_COMMAND=\"_vaultd_autolock;$PROMPT_COMMAND\"; else PROMPT_COMMAND=\"_vaultd_autolock\"; fi"
+            );
+            println!("export PROMPT_COMMAND");
+        }
+        server::Shell::Fish => {
+            println!("function _vaultd_autolock --on-event fish_prompt");
+            println!("    test -S \"$VAULTD_SOCKET\"; or exit 0");
+            println!("end");
+        }
+        server::Shell::Zsh => {}
+    }
+
     Ok(())
 }
 

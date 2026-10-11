@@ -12,7 +12,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
-    time::Instant,
 };
 
 use anyhow::Result;
@@ -36,6 +35,11 @@ const MAX_WORKERS: usize = 16;
 /// Supervisor poll quantum: keeps `Lock` shutdown and thread reaping
 /// responsive without a wake pipe.
 const POLL_TIMEOUT_MS: i32 = 100;
+/// Grace after `Lock` before the `SIGKILL` backstop: a vault shell
+/// sitting at its prompt exits cleanly by itself via its auto-lock
+/// hook (no `killed` report). The backstop is the zeroize guarantee
+/// for shells that never reach a prompt.
+const LOCK_CLEAN_EXIT_GRACE: Duration = Duration::from_millis(500);
 
 /// Shell spawned for the vault session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,7 +514,26 @@ pub fn spawn_daemon_and_shell(vault: Vault, socket_path: PathBuf) -> Result<()> 
 
     drop(vault);
 
-    exec_vault_shell(shell, &socket_path, &session_token)
+    // zsh functions cannot survive the `exec` into the final shell, so
+    // the auto-lock hook travels via a generated `ZDOTDIR` init. A
+    // write failure only loses the clean exit (the daemon `SIGKILL`
+    // backstop still guarantees the lock), so warn and continue.
+    let zdotdir = if shell == Shell::Zsh {
+        match hook_dir_for_socket(&socket_path) {
+            Some(dir) => match write_zsh_hook(&dir, &user_zsh_rc()) {
+                Ok(()) => Some(dir),
+                Err(error) => {
+                    eprintln!("warning: vaultd zsh hook unavailable: {error:#}");
+                    None
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    exec_vault_shell(shell, &socket_path, &session_token, zdotdir)
 }
 
 fn daemon_main(
@@ -607,6 +630,9 @@ fn daemon_main(
             drop(vault);
             let _ = fs::remove_file(path);
             let _ = fs::remove_file(&token_path);
+            if let Some(hook_dir) = hook_dir_for_socket(path) {
+                let _ = fs::remove_dir_all(hook_dir);
+            }
             // Daemon is going away unexpectedly: don't leave the vault
             // shell orphaned with secrets in its environment.
             terminate_vault_shell(pidfd);
@@ -618,12 +644,20 @@ fn daemon_main(
     drop(vault);
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(&token_path);
+    if let Some(hook_dir) = hook_dir_for_socket(path) {
+        let _ = fs::remove_dir_all(hook_dir);
+    }
 
     if reason == ShutdownReason::LockRequested {
         // `Lock` stopped the daemon but the vault shell (watched via
         // pidfd) would otherwise survive with secrets still exported.
-        // End it so `lock` really locks.
-        terminate_vault_shell(pidfd);
+        // A shell at its prompt exits cleanly by itself via its
+        // auto-lock hook once the socket is gone; the `SIGKILL`
+        // backstop below is the zeroize guarantee for the rest.
+        std::thread::sleep(LOCK_CLEAN_EXIT_GRACE);
+        if !pidfd_has_exited(pidfd) {
+            terminate_vault_shell(pidfd);
+        }
     }
 
     Ok(())
@@ -891,49 +925,69 @@ fn pidfd_has_exited(pidfd: RawFd) -> bool {
     ret > 0 && (pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0)
 }
 
-/// Block up to `timeout` for the pidfd's process to exit.
-fn wait_pidfd_exit(pidfd: RawFd, timeout: Duration) -> bool {
-    let start = Instant::now();
-    loop {
-        if pidfd_has_exited(pidfd) {
-            return true;
-        }
-        if start.elapsed() >= timeout {
-            return pidfd_has_exited(pidfd);
-        }
-        let mut pfd = libc::pollfd {
-            fd: pidfd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return false;
-        }
-        if ret > 0 && (pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0) {
-            return true;
-        }
-    }
+/// End the vault shell after `Lock` (or an unexpected daemon failure).
+/// Lock is zeroize: the shell holds secrets in its environment, so it
+/// dies via `SIGKILL` — no traps, no history save. Best-effort: an
+/// already-exited shell (`ESRCH`) is ignored.
+fn terminate_vault_shell(pidfd: RawFd) {
+    pidfd_send_signal(pidfd, libc::SIGKILL);
 }
 
-/// End the vault shell after `Lock` (or an unexpected daemon failure).
-/// Interactive `bash`/`zsh` ignore `SIGTERM` but die on `SIGHUP`;
-/// `fish` ignores both, so fall back to `SIGKILL`. Best-effort: a shell
-/// that already exited is the common case for the `ShellExited` path.
-fn terminate_vault_shell(pidfd: RawFd) {
-    if pidfd_has_exited(pidfd) {
-        return;
+/// Directory holding the generated zsh init for a vault session,
+/// derived from the socket path so the unlock parent (writer) and the
+/// daemon (cleaner) agree without extra plumbing. Holds no secrets,
+/// only the auto-lock hook.
+pub fn hook_dir_for_socket(socket_path: &Path) -> Option<PathBuf> {
+    let name = socket_path.file_name()?.to_string_lossy();
+    let hash = name.strip_prefix("vaultd-")?.strip_suffix(".sock")?;
+    let parent = socket_path.parent().filter(|p| !p.as_os_str().is_empty())?;
+    Some(parent.join(format!("zsh-{hash}")))
+}
+
+/// Write the zsh init for a vault session: user rc first, then the
+/// auto-lock hook that exits the shell at the next prompt once the
+/// daemon socket is gone. zsh functions cannot survive the `exec`
+/// into the final shell, so the hook travels via `ZDOTDIR`, not env.
+fn write_zsh_hook(dir: &Path, user_rc: &str) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    let content = format!(
+        "# vaultd vault-shell init (auto-generated, holds no secrets).\n\
+         if [ -f {user_rc} ]; then\n\
+         \x20 source {user_rc}\n\
+         fi\n\
+         _vaultd_autolock() {{\n\
+         \x20 [ -S \"${{VAULTD_SOCKET:-}}\" ] || exit 0\n\
+         }}\n\
+         typeset -ga precmd_functions\n\
+         if (( ! ${{precmd_functions[(I)_vaultd_autolock]}} )); then\n\
+         \x20 precmd_functions+=(_vaultd_autolock)\n\
+         fi\n"
+    );
+    fs::write(dir.join(".zshrc"), content)?;
+    let _ = fs::set_permissions(dir.join(".zshrc"), fs::Permissions::from_mode(0o600));
+    Ok(())
+}
+
+/// Single-quote a path for embedding in the generated zsh init.
+fn zsh_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// The user's own zsh rc, resolved before `ZDOTDIR` is overridden:
+/// `$ZDOTDIR/.zshrc` when set, else `$HOME/.zshrc`.
+fn user_zsh_rc() -> String {
+    if let Ok(dir) = std::env::var("ZDOTDIR")
+        && !dir.trim().is_empty()
+    {
+        return zsh_single_quote(&format!("{dir}/.zshrc"));
     }
-    pidfd_send_signal(pidfd, libc::SIGHUP);
-    if wait_pidfd_exit(pidfd, Duration::from_millis(1000)) {
-        return;
+    if let Ok(home) = std::env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        return zsh_single_quote(&format!("{home}/.zshrc"));
     }
-    pidfd_send_signal(pidfd, libc::SIGKILL);
-    let _ = wait_pidfd_exit(pidfd, Duration::from_millis(1000));
+    "'~/.zshrc'".to_string()
 }
 
 fn write_byte(fd: RawFd, byte: u8) -> Result<()> {
@@ -1013,6 +1067,7 @@ fn exec_vault_shell(
     shell: Shell,
     socket_path: &Path,
     session_token: &[u8; TOKEN_BYTES],
+    zdotdir: Option<PathBuf>,
 ) -> Result<()> {
     use std::io::Write;
     use std::os::unix::process::CommandExt;
@@ -1051,13 +1106,16 @@ fn exec_vault_shell(
         binary
     );
 
-    let err = std::process::Command::new(binary)
-        .arg("-i")
+    let mut cmd = std::process::Command::new(binary);
+    cmd.arg("-i")
         .arg("-c")
         .arg(script)
         .env(SOCKET_ENV, socket_path)
-        .env(TOKEN_ENV, encode_token_hex(session_token))
-        .exec();
+        .env(TOKEN_ENV, encode_token_hex(session_token));
+    if let Some(dir) = zdotdir {
+        cmd.env("ZDOTDIR", dir);
+    }
+    let err = cmd.exec();
 
     anyhow::bail!("failed to spawn vault shell ({binary}): {err}")
 }
