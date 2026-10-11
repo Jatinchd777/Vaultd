@@ -12,6 +12,8 @@ _Encrypted vault for local dev secrets that exist only while you work._
 <br>
 <img alt="Platform: Linux" src="https://img.shields.io/static/v1?label=platform&message=Linux&style=for-the-badge&labelColor=FAFAFA&color=1C1917">
 <a href="https://github.com/Jatinchd777/Vaultd"><img alt="stars" src="https://img.shields.io/github/stars/Jatinchd777/Vaultd?color=1C1917&logo=github&style=for-the-badge&logoColor=1C1917&labelColor=FAFAFA"></a>
+<br><br>
+<img alt="vaultd demo" src="assets/demo.gif">
 <br>
 
 <a href="#installation">Installation</a>
