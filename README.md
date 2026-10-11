@@ -8,7 +8,7 @@ _Encrypted vault for local dev secrets that exist only while you work._
 <br><br>
 
 <a href="LICENSE"><img alt="license" src="https://custom-icon-badges.demolab.com/crates/l/vaultd?color=1C1917&logo=law&style=for-the-badge&logoColor=1C1917&labelColor=FAFAFA"></a>
-<a href="https://crates.io/crates/vaultd"><img alt="version" src="https://img.shields.io/crates/v/vaultd?label=version&color=1C1917&logo=rust&style=for-the-badge&logoColor=1C1917&labelColor=FAFAFA"></a>
+<a href="https://crates.io/crates/vaultd"><img alt="version" src="https://img.shields.io/crates/v/vaultd?label=crates.io&color=1C1917&style=for-the-badge&labelColor=FAFAFA"></a>
 <br>
 <img alt="Platform: Linux" src="https://img.shields.io/static/v1?label=platform&message=Linux&style=for-the-badge&labelColor=FAFAFA&color=1C1917">
 <a href="https://github.com/Jatinchd777/Vaultd"><img alt="stars" src="https://img.shields.io/github/stars/Jatinchd777/Vaultd?color=1C1917&logo=github&style=for-the-badge&logoColor=1C1917&labelColor=FAFAFA"></a>
