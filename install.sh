@@ -7,7 +7,7 @@
 # Run it directly:
 #   curl -fsSL https://raw.githubusercontent.com/Jatinchd777/Vaultd/main/install.sh | sh
 #
-# Requires: git, cargo (Rust toolchain), Linux, zsh.
+# Requires: git, cargo (Rust toolchain), Linux, zsh or bash.
 
 set -eu
 

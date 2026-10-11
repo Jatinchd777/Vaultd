@@ -482,3 +482,48 @@ pub fn have_zsh() -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
+
+pub fn have_bash() -> bool {
+    Command::new("bash")
+        .arg("-c")
+        .arg("true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Pty spawn with extra env vars (e.g. `VAULTD_SHELL`), for shell
+/// selection tests. Mirrors `spawn_pty` otherwise.
+pub fn spawn_pty_with_extra(env: &Env, args: &[&str], extra: &[(&str, &str)]) -> PtySession {
+    let pty = Pty::open();
+    let slave_path = pty.slave_path();
+    let open_slave = || {
+        let bytes = slave_path.as_os_str().as_bytes();
+        let fd = unsafe { libc::open(bytes.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        assert!(fd >= 0, "failed to open pty slave");
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    };
+    let mut cmd = env.base_command(args);
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    cmd.stdin(Stdio::from(open_slave()))
+        .stdout(Stdio::from(open_slave()))
+        .stderr(Stdio::from(open_slave()));
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().expect("failed to spawn vaultd");
+    PtySession { child, pty }
+}

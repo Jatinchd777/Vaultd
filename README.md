@@ -110,7 +110,7 @@ While unlocked you work in a shell that has your secrets. When you leave, the se
 
 - Linux
 
-You also need `zsh`, since the vault shell runs on `zsh -i`, and a Rust toolchain if you're building from source.
+You also need `zsh` or `bash`, since the vault shell runs on `zsh -i` or `bash -i` (detected from your invoking shell, override with `VAULTD_SHELL`), and a Rust toolchain if you're building from source.
 
 <h2 id="installation">
      <sub>
@@ -338,7 +338,7 @@ Normal. Git doesn't keep `0600`/`0700` modes, so files come back `0644`/`0755`. 
 
 **Do I need `zsh`?**
 
-Yes, for now. The vault shell runs on `zsh -i`. If it is missing, unlocking fails when it tries to spawn the shell.
+You need `zsh` or `bash`. vaultd detects the shell you ran `unlock` from (`$BASH_VERSION`/`$ZSH_VERSION`, parent process, then `$SHELL`, falling back to `zsh`) and spawns the same shell with your secrets. Set `VAULTD_SHELL=bash` or `VAULTD_SHELL=zsh` to override. If the detected shell is missing, unlocking fails when it tries to spawn it.
 
 <h2 id="development">
      <sub>

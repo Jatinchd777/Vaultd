@@ -36,6 +36,96 @@ const MAX_WORKERS: usize = 16;
 /// responsive without a wake pipe.
 const POLL_TIMEOUT_MS: i32 = 100;
 
+/// Shell spawned for the vault session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shell {
+    Bash,
+    Zsh,
+}
+
+impl Shell {
+    pub fn binary(self) -> &'static str {
+        match self {
+            Shell::Bash => "bash",
+            Shell::Zsh => "zsh",
+        }
+    }
+}
+
+/// Parse a shell name or path (`bash`, `/bin/bash`) into a supported shell.
+pub fn parse_shell_name(s: &str) -> Result<Shell> {
+    let base = s.rsplit('/').next().unwrap_or(s).trim();
+    match base {
+        "bash" => Ok(Shell::Bash),
+        "zsh" => Ok(Shell::Zsh),
+        other => anyhow::bail!("unsupported shell '{other}': set VAULTD_SHELL to bash or zsh"),
+    }
+}
+
+/// Pure selection logic, kept separate from env reads so it can be unit
+/// tested without mutating process globals.
+pub fn select_shell(
+    override_name: Option<&str>,
+    bash_marker: bool,
+    zsh_marker: bool,
+    parent_comm: Option<&str>,
+    shell_env: Option<&str>,
+) -> Result<Shell> {
+    if let Some(name) = override_name
+        && !name.trim().is_empty()
+    {
+        return parse_shell_name(name);
+    }
+    match (bash_marker, zsh_marker) {
+        (true, false) => return Ok(Shell::Bash),
+        (false, true) => return Ok(Shell::Zsh),
+        _ => {}
+    }
+    if let Some(comm) = parent_comm {
+        let comm = comm.trim();
+        if comm.contains("bash") {
+            return Ok(Shell::Bash);
+        }
+        if comm.contains("zsh") {
+            return Ok(Shell::Zsh);
+        }
+    }
+    if let Some(shell) = shell_env
+        && !shell.trim().is_empty()
+    {
+        return parse_shell_name(shell);
+    }
+    Ok(Shell::Zsh)
+}
+
+fn parent_comm_name() -> Option<String> {
+    let ppid = unsafe { libc::getppid() };
+    let path = format!("/proc/{ppid}/comm");
+    fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
+/// Detect which shell invoked `unlock`: explicit `VAULTD_SHELL` wins,
+/// then invoking-shell markers (`BASH_VERSION`/`ZSH_VERSION`), then the
+/// parent process name, then `$SHELL`. Falls back to `zsh`.
+pub fn detect_shell() -> Result<Shell> {
+    let override_name = std::env::var("VAULTD_SHELL").ok();
+    let bash_marker = std::env::var_os("BASH_VERSION")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let zsh_marker = std::env::var_os("ZSH_VERSION")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let parent_comm = parent_comm_name();
+    let shell_env = std::env::var("SHELL").ok();
+    select_shell(
+        override_name.as_deref(),
+        bash_marker,
+        zsh_marker,
+        parent_comm.as_deref(),
+        shell_env.as_deref(),
+    )
+}
+
 pub fn runtime_base_dir() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("vaultd"),
@@ -294,6 +384,9 @@ pub fn is_running() -> Result<bool> {
 }
 
 pub fn spawn_daemon_and_shell(vault: Vault, socket_path: PathBuf) -> Result<()> {
+    // Validate the shell before forking so an unsupported value fails
+    // fast without starting a daemon that would immediately shut down.
+    let shell = detect_shell()?;
     let session_token = generate_session_token()?;
     let mut pipe_fds = [0 as libc::c_int; 2];
 
@@ -392,7 +485,7 @@ pub fn spawn_daemon_and_shell(vault: Vault, socket_path: PathBuf) -> Result<()> 
 
     drop(vault);
 
-    exec_vault_shell(&socket_path, &session_token)
+    exec_vault_shell(shell, &socket_path, &session_token)
 }
 
 fn daemon_main(
@@ -800,11 +893,16 @@ fn detach_standard_streams() {
     }
 }
 
-fn exec_vault_shell(socket_path: &Path, session_token: &[u8; TOKEN_BYTES]) -> Result<()> {
+fn exec_vault_shell(
+    shell: Shell,
+    socket_path: &Path,
+    session_token: &[u8; TOKEN_BYTES],
+) -> Result<()> {
     use std::io::Write;
     use std::os::unix::process::CommandExt;
 
-    println!("Vault unlocked - entering vault shell (exit to auto-lock)");
+    let binary = shell.binary();
+    println!("Vault unlocked - entering vault shell ({binary}, exit to auto-lock)");
 
     let _ = std::io::stdout().flush();
 
@@ -812,9 +910,9 @@ fn exec_vault_shell(socket_path: &Path, session_token: &[u8; TOKEN_BYTES]) -> Re
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "vaultd".to_string());
     let vaultd_quoted = shell_single_quote(&vaultd_exe);
-    let script = format!("eval \"$({vaultd_quoted} __env)\"; exec zsh -i");
+    let script = format!("eval \"$({vaultd_quoted} __env)\"; exec {binary} -i");
 
-    let err = std::process::Command::new("zsh")
+    let err = std::process::Command::new(binary)
         .arg("-i")
         .arg("-c")
         .arg(script)
@@ -822,7 +920,7 @@ fn exec_vault_shell(socket_path: &Path, session_token: &[u8; TOKEN_BYTES]) -> Re
         .env(TOKEN_ENV, encode_token_hex(session_token))
         .exec();
 
-    anyhow::bail!("failed to spawn vault shell (zsh): {err}")
+    anyhow::bail!("failed to spawn vault shell ({binary}): {err}")
 }
 
 fn shell_single_quote(value: &str) -> String {
