@@ -2,31 +2,36 @@ use anyhow::Result;
 
 use crate::daemon::{client, server};
 
-pub fn run() -> Result<()> {
+pub fn run(shell: Option<String>) -> Result<()> {
+    let shell = match shell {
+        Some(name) => server::parse_shell_name(&name)?,
+        None => server::detect_shell()?,
+    };
     let socket_path = server::socket_path()?;
     let token = server::load_client_token()?;
     let environment = client::environment()?;
+    let fish = shell == server::Shell::Fish;
 
-    println!(
-        "export {}={}",
-        server::SOCKET_ENV,
-        shell_escape(&socket_path.to_string_lossy())
-    );
-    println!(
-        "export {}={}",
-        server::TOKEN_ENV,
-        shell_escape(&server::encode_token_hex(&token))
-    );
+    emit("VAULTD_SOCKET", &socket_path.to_string_lossy(), fish);
+    emit("VAULTD_TOKEN", &server::encode_token_hex(&token), fish);
 
     for (name, value) in &environment {
         if !valid_name(name) {
             anyhow::bail!("invalid environment variable name: {name}");
         }
 
-        println!("export {name}={}", shell_escape(value));
+        emit(name, value, fish);
     }
 
     Ok(())
+}
+
+fn emit(name: &str, value: &str, fish: bool) {
+    if fish {
+        println!("set -gx {name} {}", shell_escape(value));
+    } else {
+        println!("export {name}={}", shell_escape(value));
+    }
 }
 
 fn valid_name(name: &str) -> bool {

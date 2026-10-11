@@ -495,6 +495,18 @@ pub fn have_bash() -> bool {
         .unwrap_or(false)
 }
 
+pub fn have_fish() -> bool {
+    Command::new("fish")
+        .arg("-c")
+        .arg("true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Pty spawn with extra env vars (e.g. `VAULTD_SHELL`), for shell
 /// selection tests. Mirrors `spawn_pty` otherwise.
 pub fn spawn_pty_with_extra(env: &Env, args: &[&str], extra: &[(&str, &str)]) -> PtySession {

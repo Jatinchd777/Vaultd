@@ -6,8 +6,8 @@
 //! `src/daemon/client.rs`, none of which had tests.
 
 use crate::common::{
-    Env, TIMEOUT, have_bash, have_zsh, init_vault, spawn_pty, spawn_pty_with_extra, stderr, stdout,
-    wait_exit,
+    Env, TIMEOUT, have_bash, have_fish, have_zsh, init_vault, spawn_pty, spawn_pty_with_extra,
+    stderr, stdout, wait_exit,
 };
 use std::time::Duration;
 use vaultd::daemon::server;
@@ -167,43 +167,73 @@ fn shell_parse_accepts_names_and_paths() {
         server::parse_shell_name("/usr/bin/zsh").unwrap(),
         server::Shell::Zsh
     );
-    assert!(server::parse_shell_name("fish").is_err());
+    assert_eq!(
+        server::parse_shell_name("fish").unwrap(),
+        server::Shell::Fish
+    );
+    assert_eq!(
+        server::parse_shell_name("/usr/bin/fish").unwrap(),
+        server::Shell::Fish
+    );
+    assert!(server::parse_shell_name("tcsh").is_err());
     assert!(server::parse_shell_name("").is_err());
 }
 
 #[test]
 fn shell_select_prefers_override_then_markers() {
+    use server::Shell::{Bash, Fish, Zsh};
     // Explicit override wins over everything.
     assert_eq!(
-        server::select_shell(Some("bash"), false, true, Some("zsh"), Some("/bin/zsh")).unwrap(),
-        server::Shell::Bash
+        server::select_shell(
+            Some("bash"),
+            false,
+            true,
+            false,
+            Some("zsh"),
+            Some("/bin/zsh")
+        )
+        .unwrap(),
+        Bash
+    );
+    // Fish marker beats bash/zsh markers (innermost nested shell wins).
+    assert_eq!(
+        server::select_shell(None, true, true, true, Some("bash"), Some("/bin/bash")).unwrap(),
+        Fish
     );
     // Invoking-shell markers beat parent comm and $SHELL.
     assert_eq!(
-        server::select_shell(None, true, false, Some("zsh"), Some("/bin/zsh")).unwrap(),
-        server::Shell::Bash
+        server::select_shell(None, true, false, false, Some("zsh"), Some("/bin/zsh")).unwrap(),
+        Bash
     );
     assert_eq!(
-        server::select_shell(None, false, true, Some("bash"), Some("/bin/bash")).unwrap(),
-        server::Shell::Zsh
+        server::select_shell(None, false, true, false, Some("bash"), Some("/bin/bash")).unwrap(),
+        Zsh
     );
     // Parent comm beats $SHELL.
     assert_eq!(
-        server::select_shell(None, false, false, Some("bash"), Some("/bin/zsh")).unwrap(),
-        server::Shell::Bash
+        server::select_shell(None, false, false, false, Some("fish"), Some("/bin/zsh")).unwrap(),
+        Fish
+    );
+    assert_eq!(
+        server::select_shell(None, false, false, false, Some("bash"), Some("/bin/zsh")).unwrap(),
+        Bash
     );
     // $SHELL paths are accepted.
     assert_eq!(
-        server::select_shell(None, false, false, None, Some("/bin/bash")).unwrap(),
-        server::Shell::Bash
+        server::select_shell(None, false, false, false, None, Some("/usr/bin/fish")).unwrap(),
+        Fish
+    );
+    assert_eq!(
+        server::select_shell(None, false, false, false, None, Some("/bin/bash")).unwrap(),
+        Bash
     );
     // Fallback is zsh for back-compat.
     assert_eq!(
-        server::select_shell(None, false, false, None, None).unwrap(),
-        server::Shell::Zsh
+        server::select_shell(None, false, false, false, None, None).unwrap(),
+        Zsh
     );
     // Bad override is an error, not a silent fallback.
-    assert!(server::select_shell(Some("fish"), false, false, None, None).is_err());
+    assert!(server::select_shell(Some("tcsh"), false, false, false, None, None).is_err());
 }
 
 // --- Black-box socket auth (drives the real binary) ---
@@ -589,17 +619,126 @@ fn unsupported_shell_fails_fast_without_daemon() {
     }
     let env = Env::new("daemon-bad-shell");
     init_vault(&env, PASSWORD);
-    let mut shell = spawn_pty_with_extra(&env, &["unlock"], &[("VAULTD_SHELL", "fish")]);
+    let mut shell = spawn_pty_with_extra(&env, &["unlock"], &[("VAULTD_SHELL", "tcsh")]);
     shell.pty.read_until("Master password:", TIMEOUT);
     shell.pty.send(&format!("{PASSWORD}\n"));
     let text = shell
         .pty
         .read_until("unsupported shell", Duration::from_secs(30));
-    assert!(text.contains("fish"), "unexpected error:\n{text}");
+    assert!(text.contains("tcsh"), "unexpected error:\n{text}");
     // No daemon may be left behind by the rejected shell.
     assert!(
         !env.socket().exists(),
         "daemon socket should not exist for unsupported shell"
     );
+    let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
+}
+
+#[test]
+fn fish_shell_roundtrip() {
+    if !have_fish() {
+        eprintln!("skipping: fish is required for the vault shell");
+        return;
+    }
+    let env = Env::new("daemon-fish-shell");
+    init_vault(&env, PASSWORD);
+    let mut shell = spawn_pty_with_extra(&env, &["unlock"], &[("VAULTD_SHELL", "fish")]);
+    shell.pty.read_until("Master password:", TIMEOUT);
+    shell.pty.send(&format!("{PASSWORD}\n"));
+    shell.pty.read_until("Vault unlocked", TIMEOUT);
+    env.wait_for_socket(Duration::from_secs(30));
+
+    // Prove the spawned shell really is fish.
+    shell
+        .pty
+        .send("echo VAULTD_PROBE_FISH_VERSION=$FISH_VERSION\n");
+    shell
+        .pty
+        .read_until("VAULTD_PROBE_FISH_VERSION=", Duration::from_secs(10));
+
+    // Full CRUD through the daemon while the fish shell owns the session.
+    let out = env.run(&["add", "FISH_KEY", "fish-value"], "");
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let out = env.run(&["get", "FISH_KEY"], "");
+    assert!(out.status.success(), "get failed: {}", stderr(&out));
+    assert_eq!(stdout(&out).trim_end(), "fish-value");
+    let out = env.run(&["list"], "");
+    assert!(out.status.success(), "list failed: {}", stderr(&out));
+    assert!(stdout(&out).contains("FISH_KEY"));
+
+    let _ = env.run(&["lock"], "");
+    env.wait_for_gone(&env.socket(), Duration::from_secs(10));
+    shell.pty.send("exit\n");
+    let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
+}
+
+#[test]
+fn env_shell_flag_emits_per_shell_syntax() {
+    if !have_zsh() && !have_bash() && !have_fish() {
+        eprintln!("skipping: no supported shell for the vault session");
+        return;
+    }
+    let env = Env::new("daemon-env-shell-flag");
+    init_vault(&env, PASSWORD);
+    // Unlock with whatever shell detects; only the daemon matters here.
+    let mut shell = spawn_pty(&env, &["unlock"]);
+    shell.pty.read_until("Master password:", TIMEOUT);
+    shell.pty.send(&format!("{PASSWORD}\n"));
+    shell.pty.read_until("Vault unlocked", TIMEOUT);
+    env.wait_for_socket(Duration::from_secs(30));
+
+    assert!(env.run(&["add", "PLAIN", "secret-1"], "").status.success());
+
+    let out = env.run(&["__env", "--shell", "fish"], "");
+    assert!(
+        out.status.success(),
+        "__env --shell fish failed: {}",
+        stderr(&out)
+    );
+    let fish_text = stdout(&out);
+    assert!(
+        fish_text.contains("set -gx VAULTD_SOCKET "),
+        "missing fish socket:\n{fish_text}"
+    );
+    assert!(
+        fish_text.contains("set -gx VAULTD_TOKEN "),
+        "missing fish token:\n{fish_text}"
+    );
+    assert!(
+        fish_text.contains("set -gx PLAIN 'secret-1'"),
+        "missing fish secret:\n{fish_text}"
+    );
+    assert!(
+        !fish_text.contains("export "),
+        "fish output must not use export:\n{fish_text}"
+    );
+
+    let out = env.run(&["__env", "--shell", "bash"], "");
+    assert!(
+        out.status.success(),
+        "__env --shell bash failed: {}",
+        stderr(&out)
+    );
+    let bash_text = stdout(&out);
+    assert!(
+        bash_text.contains("export PLAIN='secret-1'"),
+        "missing bash secret:\n{bash_text}"
+    );
+    assert!(
+        !bash_text.contains("set -gx"),
+        "bash output must not use set -gx:\n{bash_text}"
+    );
+
+    let out = env.run(&["__env", "--shell", "tcsh"], "");
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("unsupported shell"),
+        "unexpected stderr: {}",
+        stderr(&out)
+    );
+
+    let _ = env.run(&["lock"], "");
+    env.wait_for_gone(&env.socket(), Duration::from_secs(10));
+    shell.pty.send("exit\n");
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
 }

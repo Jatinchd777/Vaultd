@@ -58,5 +58,10 @@ pub enum Command {
     Passwd,
 
     #[command(name = "__env", hide = true)]
-    Env,
+    Env {
+        /// Shell syntax to emit (`bash`, `zsh`, or `fish`).
+        /// Defaults to detecting the invoking shell.
+        #[arg(long)]
+        shell: Option<String>,
+    },
 }

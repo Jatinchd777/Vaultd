@@ -24,6 +24,6 @@ pub fn run(command: Command) -> Result<()> {
         Command::Add { name, value } => add::run(name, value),
         Command::List => list::run(),
         Command::Passwd => passwd::run(),
-        Command::Env => env::run(),
+        Command::Env { shell } => env::run(shell),
     }
 }

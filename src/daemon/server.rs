@@ -41,6 +41,7 @@ const POLL_TIMEOUT_MS: i32 = 100;
 pub enum Shell {
     Bash,
     Zsh,
+    Fish,
 }
 
 impl Shell {
@@ -48,7 +49,13 @@ impl Shell {
         match self {
             Shell::Bash => "bash",
             Shell::Zsh => "zsh",
+            Shell::Fish => "fish",
         }
+    }
+
+    /// `true` for POSIX-style shells sharing `export` syntax.
+    pub fn is_posix(self) -> bool {
+        !matches!(self, Shell::Fish)
     }
 }
 
@@ -58,7 +65,10 @@ pub fn parse_shell_name(s: &str) -> Result<Shell> {
     match base {
         "bash" => Ok(Shell::Bash),
         "zsh" => Ok(Shell::Zsh),
-        other => anyhow::bail!("unsupported shell '{other}': set VAULTD_SHELL to bash or zsh"),
+        "fish" => Ok(Shell::Fish),
+        other => {
+            anyhow::bail!("unsupported shell '{other}': set VAULTD_SHELL to bash, zsh, or fish")
+        }
     }
 }
 
@@ -68,6 +78,7 @@ pub fn select_shell(
     override_name: Option<&str>,
     bash_marker: bool,
     zsh_marker: bool,
+    fish_marker: bool,
     parent_comm: Option<&str>,
     shell_env: Option<&str>,
 ) -> Result<Shell> {
@@ -76,6 +87,12 @@ pub fn select_shell(
     {
         return parse_shell_name(name);
     }
+    // Invoking-shell markers beat parent comm and $SHELL. When several
+    // are set (nested shells), prefer the innermost known marker in
+    // fish, zsh, bash order.
+    if fish_marker {
+        return Ok(Shell::Fish);
+    }
     match (bash_marker, zsh_marker) {
         (true, false) => return Ok(Shell::Bash),
         (false, true) => return Ok(Shell::Zsh),
@@ -83,6 +100,9 @@ pub fn select_shell(
     }
     if let Some(comm) = parent_comm {
         let comm = comm.trim();
+        if comm.contains("fish") {
+            return Ok(Shell::Fish);
+        }
         if comm.contains("bash") {
             return Ok(Shell::Bash);
         }
@@ -105,8 +125,8 @@ fn parent_comm_name() -> Option<String> {
 }
 
 /// Detect which shell invoked `unlock`: explicit `VAULTD_SHELL` wins,
-/// then invoking-shell markers (`BASH_VERSION`/`ZSH_VERSION`), then the
-/// parent process name, then `$SHELL`. Falls back to `zsh`.
+/// then invoking-shell markers (`BASH_VERSION`/`ZSH_VERSION`/`FISH_VERSION`),
+/// then the parent process name, then `$SHELL`. Falls back to `zsh`.
 pub fn detect_shell() -> Result<Shell> {
     let override_name = std::env::var("VAULTD_SHELL").ok();
     let bash_marker = std::env::var_os("BASH_VERSION")
@@ -115,12 +135,16 @@ pub fn detect_shell() -> Result<Shell> {
     let zsh_marker = std::env::var_os("ZSH_VERSION")
         .map(|v| !v.is_empty())
         .unwrap_or(false);
+    let fish_marker = std::env::var_os("FISH_VERSION")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
     let parent_comm = parent_comm_name();
     let shell_env = std::env::var("SHELL").ok();
     select_shell(
         override_name.as_deref(),
         bash_marker,
         zsh_marker,
+        fish_marker,
         parent_comm.as_deref(),
         shell_env.as_deref(),
     )
@@ -909,8 +933,31 @@ fn exec_vault_shell(
     let vaultd_exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "vaultd".to_string());
+
+    if shell == Shell::Fish {
+        // Capital `-C` runs init commands then stays interactive;
+        // lowercase `-c` would exit at once and the daemon would
+        // auto-lock via its pidfd watch.
+        let init = format!(
+            "{} __env --shell fish | source",
+            shell_single_quote(&vaultd_exe)
+        );
+        let err = std::process::Command::new("fish")
+            .arg("-i")
+            .arg("-C")
+            .arg(init)
+            .env(SOCKET_ENV, socket_path)
+            .env(TOKEN_ENV, encode_token_hex(session_token))
+            .exec();
+
+        anyhow::bail!("failed to spawn vault shell (fish): {err}")
+    }
+
     let vaultd_quoted = shell_single_quote(&vaultd_exe);
-    let script = format!("eval \"$({vaultd_quoted} __env)\"; exec {binary} -i");
+    let script = format!(
+        "eval \"$({vaultd_quoted} __env --shell {})\"; exec {binary} -i",
+        binary
+    );
 
     let err = std::process::Command::new(binary)
         .arg("-i")

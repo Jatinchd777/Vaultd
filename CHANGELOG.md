@@ -4,6 +4,19 @@ All notable changes to vaultd are documented here. Entries mirror the
 GitHub releases (`v0.1.0` … `v0.4.0`); the top section tracks work not
 yet released.
 
+## [v0.4.2]
+
+### Added
+- Fish vault shells: `unlock` detects `fish` (`$FISH_VERSION`, parent
+  process, `$SHELL`, or `VAULTD_SHELL=fish`) and spawns `fish -i`,
+  loading secrets via `vaultd __env --shell fish | source`.
+- Hidden `vaultd __env --shell <bash|zsh|fish>` flag selecting the
+  output syntax (`export` vs `set -gx`); defaults to detecting the
+  invoking shell. The spawn path passes it explicitly so loading never
+  depends on re-detection.
+
+No protocol change, existing sessions stay compatible.
+
 ## [v0.4.1]
 
 ### Added
