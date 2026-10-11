@@ -1,11 +1,13 @@
 use std::io::{self, Write};
 
 use anyhow::Result;
+use zeroize::Zeroizing;
 
 use crate::{
     crypto::{
         cipher,
         kdf::{self, KdfParams},
+        password,
     },
     storage::{
         filesystem,
@@ -14,7 +16,13 @@ use crate::{
 };
 
 pub fn run() -> Result<()> {
-    filesystem::create_vault_directory()?;
+    // Refuse up front so a later failure never leaves a half-made vault
+    // behind and the user is not prompted for nothing.
+    let cwd = std::env::current_dir()?;
+    if filesystem::find_project_root_from(&cwd).is_ok() {
+        let existing = filesystem::find_project_root_from(&cwd)?;
+        anyhow::bail!("vault already exists at {}", existing.display());
+    }
 
     let password = prompt_password("Create master password: ")?;
     let confirmation = prompt_password("Confirm master password: ")?;
@@ -22,6 +30,10 @@ pub fn run() -> Result<()> {
     if password != confirmation {
         anyhow::bail!("passwords do not match");
     }
+
+    password::check_new_password(&password)?;
+
+    filesystem::create_vault_directory()?;
 
     let params = KdfParams::generate()?;
 
@@ -52,9 +64,9 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn prompt_password(prompt: &str) -> Result<String> {
+fn prompt_password(prompt: &str) -> Result<Zeroizing<String>> {
     print!("{prompt}");
     io::stdout().flush()?;
 
-    Ok(rpassword::read_password()?)
+    Ok(Zeroizing::new(rpassword::read_password()?))
 }

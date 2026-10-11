@@ -1,84 +1,166 @@
 # Changelog
 
-All notable changes to vaultd are documented here. Versions follow the
-`v0.2.x-beta` tag scheme used for GitHub releases.
+All notable changes to vaultd are documented here. Entries mirror the
+GitHub releases (`v0.1.0` … `v0.4.0`); the top section tracks work not
+yet released.
 
-## [v0.2.4-beta]
+## [v0.4.1]
 
 ### Added
-- `vaultd passwd` — change the master password. Prompt-only (takes no
-  arguments, no echo): asks for the current password, then the new one
-  twice. Re-encrypts everything under a fresh salt; the old password stops
-  working. Must be run while locked (`vaultd lock` first).
-- README documents `passwd` (usage table, prompting behavior, salt rotation).
+- Master-password policy (`src/crypto/password.rs`): `init` and
+  `passwd` reject passwords shorter than 12 characters and the
+  NordPass 2025 global top 10 most common passwords
+  (case-insensitive). `unlock` is unchanged, so existing vaults with
+  weak passwords still open.
+- `init` checks for an existing vault before prompting, so a rejected
+  password never leaves a half-made `.vaultd` behind.
+- Password prompt buffers are zeroized on drop (`init`, `unlock`,
+  `passwd`).
 
 No protocol change, existing sessions stay compatible.
 
-## [v0.2.3-beta]
+## [v0.4.0]
 
 ### Summary
-Owner-only vault files: `.vaultd` is now `0700`/`0600` under `umask 077`,
-with symlink refusal and permission repair after `git clone`.
+Bash vault shells: `unlock` now detects the shell you ran it from
+and spawns the same shell, `bash` or `zsh`. `VAULTD_SHELL` overrides
+detection.
 
 ### Changes
-- Vault dir `0700`, `manifest`/`vault` `0600` (`DirBuilder`/`OpenOptions`
-  mode + explicit `chmod`); process `umask 077`
-- Reads and writes tighten permissions back, since git checkouts come back
-  `0755`/`0644`
-- Symlinked `.vaultd`, `manifest`, `vault`, and socket paths refused
-  instead of followed; nested `.vaultd` links skipped in project search
-- `$VAULTD_SOCKET` confinement and wrong-token rejection covered by tests
-- `cargo test` is a single runner (`tests/main.rs`); suite grows 16 → 50
-  with `daemon`, `storage`, cipher/KDF, `__env` escaping, and unlock
-  failure cases
+- Auto-detects your shell (`VAULTD_SHELL` override, else `bash`/`zsh`
+  markers, parent process, `$SHELL`) and spawns `bash -i` or `zsh -i`
+- Unsupported shells fail fast with no orphan daemon
+- Tests: shell-selection units plus `bash` roundtrip and refusal
+  cases; suite 53 -> 57
 
 No protocol change, existing sessions stay compatible.
 
-## [v0.2.2-beta]
+## [v0.3.1]
 
 ### Summary
-Authenticated daemons: every request must present the unlock session token,
-so only the vault shell session can read or modify secrets.
+Concurrent daemon: one slow or huge peer can no longer stall the
+vault. Connections are handled on bounded worker threads with
+timeouts and size caps.
+
+### Changes
+- `serve_loop` (`src/daemon/server.rs`) is now a supervisor:
+  `poll(listener,pidfd)` + thread-per-accept, cap 16 with
+  `vaultd daemon is busy` reply, `100ms` quantum for `Lock`/reap
+- Per-connection `5s` read/write timeouts, `1MiB` cap
+  (`MAX_MESSAGE_BYTES` in `src/daemon/protocol.rs`); vault shared
+  via `Arc<Mutex>`, locked only while building the response
+- `src/daemon/client.rs`: fail-closed peer-cred check, `10s`
+  timeouts, response cap
+- Removed dead `vaultd-clear()`/`_VAULTD_EXPORTED` from `__env`
+  (the function was lost on `exec` and never worked)
+- Tests (`tests/daemon/mod.rs`): `slow_loris_does_not_block_others`,
+  `oversized_request_is_rejected_without_hang`,
+  `concurrent_adds_all_succeed`; suite 50 -> 53
+
+No protocol change, existing sessions stay compatible. Lock and
+unlock once after updating.
+
+## [v0.3.0]
+
+### Summary
+Password rotation: `vaultd passwd` changes the master password
+without ever taking it on the command line, and re-encrypts the
+vault under a fresh salt.
+
+### Changes
+- New `vaultd passwd` subcommand (`src/commands/passwd.rs`, wired in
+  `src/cli.rs` / `src/commands/mod.rs`): takes no arguments, extra
+  args are rejected by clap
+- Three no-echo prompts via `rpassword`, same as `init`: current
+  password, new password, confirmation
+- New `Vault::change_password` (`src/vault/store.rs`): verifies the
+  current password by unlocking first, derives a fresh key with a new
+  random salt, zeroizes the old key in memory, then rewrites
+  `manifest` + `vault`
+- Empty new passwords and mismatched confirmations are rejected
+  before anything is written
+- Refuses to run while the daemon is up (`vaultd lock` first), so no
+  stale in-memory key survives the rotation
+- Prompt buffers zeroized after use; vault (new key + plaintext)
+  zeroized on drop
+- README usage table, prompting notes, and salt-rotation line updated
+
+No protocol change, existing sessions stay compatible.
+
+## [v0.2.3]
+
+### Summary
+Owner-only vault files: `.vaultd` is now `0700`/`0600` under
+`umask 077`, with symlink refusal and permission repair after
+`git clone`.
+
+### Changes
+- Vault dir `0700`, `manifest`/`vault` `0600`
+  (`DirBuilder`/`OpenOptions` mode + explicit `chmod`); process
+  `umask 077`
+- Reads and writes tighten permissions back, since git checkouts come
+  back `0755`/`0644`
+- Symlinked `.vaultd`, `manifest`, `vault`, and socket paths refused
+  instead of followed; nested `.vaultd` links skipped in project
+  search
+- `$VAULTD_SOCKET` confinement and wrong-token rejection covered by
+  tests
+- `cargo test` is a single runner (`tests/main.rs`); suite grows
+  16 -> 50 with `daemon`, `storage`, cipher/KDF, `__env` escaping,
+  and unlock failure cases
+
+No protocol change, existing sessions stay compatible.
+
+## [v0.2.2]
+
+### Summary
+Authenticated daemons: every request must present the unlock session
+token, so only the vault shell session can read or modify secrets.
 
 ### Changes
 - Per-session token `VAULTD_TOKEN` (32B `OsRng`, hex) alongside
   `vaultd-<hash>.sock` as `vaultd-<hash>.token` (`0600`)
-- `AuthenticatedRequest { token, request }` wire format; wrong or missing
-  token returns `authentication failed`
+- `AuthenticatedRequest { token, request }` wire format; wrong or
+  missing token returns `authentication failed`
 - `SO_PEERCRED` UID check on client and daemon
 - `VAULTD_SOCKET` must live inside `$XDG_RUNTIME_DIR/vaultd/`
   (`untrusted VAULTD_SOCKET` otherwise)
 - `__env` exports `VAULTD_SOCKET` and `VAULTD_TOKEN`
-- Stale-socket cleanup never follows symlinks; `lock`/exit removes socket
-  and token
+- Stale-socket cleanup never follows symlinks; `lock`/exit removes
+  socket and token
 
-Lock and unlock once after updating, old sessions stay on the old protocol.
+Lock and unlock once after updating, old sessions stay on the old
+protocol.
 
-## [v0.2.1-beta]
+## [v0.2.1]
 
 ### Summary
-Per-project daemons: every vault gets its own socket, so two projects can
-stay unlocked side by side without commands crossing over.
+Per-project daemons: every vault gets its own socket, so two
+projects can stay unlocked side by side without commands crossing
+over.
 
 ### Changes
 - Per-project socket `SHA-256(project root)` under
   `$XDG_RUNTIME_DIR/vaultd/` (`0700` dir, `0600` socket)
 - `.vaultd` found by walking up; `init` refuses nested vaults
 - Shell pinned via `VAULTD_SOCKET` exported by `__env`
-- `unlock` / stale-socket cleanup per-project; `lock` locks current project
-  only
+- `unlock` / stale-socket cleanup per-project; `lock` locks current
+  project only
 - `clippy -D warnings` and `fmt` clean, 16/16 tests pass
 
-## [v0.1.0-beta.1]
+## [v0.1.0]
 
-Local-first encrypted secrets for dev projects: a committable `.vaultd/`
-directory plus a vault shell where secrets show up as plain environment
-variables. Leaving the shell locks everything again.
+Local-first encrypted secrets for dev projects: a committable
+`.vaultd/` directory plus a vault shell where secrets show up as
+plain environment variables. Leaving the shell locks everything
+again.
 
 - `init`, `unlock`, `lock`, `add`, `set`, `get`, `remove`, `list`
-- Argon2id key derivation, AES-256-GCM vault, master password never stored
-- Background daemon over a Unix socket only your user can reach, auto-lock
-  on shell exit
+- Argon2id key derivation, AES-256-GCM vault, master password never
+  stored
+- Background daemon over a Unix socket only your user can reach,
+  auto-lock on shell exit
 - `install.sh` one-liner plus manual build instructions
 
-No password reset by design — forget it and the vault is gone for good.
+No password reset by design: forget it and the vault is gone for
+good.

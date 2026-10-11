@@ -88,6 +88,36 @@ fn mismatched_passwords_abort_init() {
 }
 
 #[test]
+fn passwd_rejects_weak_new_password() {
+    let env = Env::new("crypto-passwd-weak");
+    init_vault(&env, PASSWORD);
+    let mut session = spawn_pty(&env, &["passwd"]);
+    session.pty.read_until("Current password:", TIMEOUT);
+    session.pty.send(&format!("{PASSWORD}\n"));
+    session.pty.read_until("New master password:", TIMEOUT);
+    session.pty.send("short\n");
+    session.pty.read_until("Confirm new password:", TIMEOUT);
+    session.pty.send("short\n");
+    let transcript = session.pty.read_until("at least 12 characters", TIMEOUT);
+    assert!(transcript.contains("at least 12 characters"));
+    let status = wait_exit(&mut session.child, TIMEOUT, "vaultd passwd");
+    assert!(!status.success());
+
+    // The failed rotation wrote nothing: the old password still works.
+    let mut retry = spawn_pty(&env, &["passwd"]);
+    retry.pty.read_until("Current password:", TIMEOUT);
+    retry.pty.send(&format!("{PASSWORD}\n"));
+    retry.pty.read_until("New master password:", TIMEOUT);
+    retry.pty.send("another strong passphrase here\n");
+    retry.pty.read_until("Confirm new password:", TIMEOUT);
+    retry.pty.send("another strong passphrase here\n");
+    let transcript = retry.pty.read_until("Master password changed", TIMEOUT);
+    assert!(transcript.contains("Master password changed"));
+    let status = wait_exit(&mut retry.child, TIMEOUT, "vaultd passwd");
+    assert!(status.success());
+}
+
+#[test]
 fn second_init_refuses_to_overwrite() {
     let env = Env::new("crypto-double");
     init_vault(&env, PASSWORD);
@@ -101,6 +131,83 @@ fn second_init_refuses_to_overwrite() {
 }
 
 // --- Direct unit tests for `src/crypto` (no vault on disk) ---
+
+#[test]
+fn password_policy_accepts_strong() {
+    use vaultd::crypto::password::check_new_password;
+    assert!(check_new_password("correct horse battery staple").is_ok());
+    assert!(check_new_password("exactly12chr").is_ok());
+}
+
+#[test]
+fn password_policy_rejects_empty_and_short() {
+    use vaultd::crypto::password::check_new_password;
+    for weak in ["", "   ", "short", "elevenchars"] {
+        let err = check_new_password(weak).unwrap_err();
+        assert!(
+            err.to_string().contains("empty") || err.to_string().contains("at least 12"),
+            "unexpected error for {weak:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn password_policy_rejects_top_10_common() {
+    use vaultd::crypto::password::check_new_password;
+    // NordPass 2025 global top 10, plus mixed-case variants.
+    for common in [
+        "123456",
+        "admin",
+        "12345678",
+        "123456789",
+        "12345",
+        "password",
+        "Aa123456",
+        "1234567890",
+        "Pass@123",
+        "admin123",
+        "Password",
+        "ADMIN123",
+        "pAsSwOrD",
+    ] {
+        let err = check_new_password(common).unwrap_err();
+        assert!(
+            err.to_string().contains("too common"),
+            "unexpected error for {common:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn weak_password_aborts_init_without_vault() {
+    let env = Env::new("crypto-weakpw");
+    let mut session = spawn_pty(&env, &["init"]);
+    session.pty.read_until("Create master password:", TIMEOUT);
+    session.pty.send("short\n");
+    session.pty.read_until("Confirm master password:", TIMEOUT);
+    session.pty.send("short\n");
+    let transcript = session.pty.read_until("at least 12 characters", TIMEOUT);
+    assert!(transcript.contains("at least 12 characters"));
+    let status = wait_exit(&mut session.child, TIMEOUT, "vaultd init");
+    assert!(!status.success());
+    // Rejected before anything is written: no directory at all.
+    assert!(!env.project.path().join(".vaultd").exists());
+}
+
+#[test]
+fn common_password_aborts_init() {
+    let env = Env::new("crypto-commonpw");
+    let mut session = spawn_pty(&env, &["init"]);
+    session.pty.read_until("Create master password:", TIMEOUT);
+    session.pty.send("admin123\n");
+    session.pty.read_until("Confirm master password:", TIMEOUT);
+    session.pty.send("admin123\n");
+    let transcript = session.pty.read_until("too common", TIMEOUT);
+    assert!(transcript.contains("too common"));
+    let status = wait_exit(&mut session.child, TIMEOUT, "vaultd init");
+    assert!(!status.success());
+    assert!(!env.project.path().join(".vaultd").exists());
+}
 
 #[test]
 fn cipher_roundtrip() {

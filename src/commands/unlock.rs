@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::io::{self, Write};
+use zeroize::Zeroizing;
 
 use crate::{daemon::server, vault::store::Vault};
 
@@ -18,9 +19,9 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn prompt_password(prompt: &str) -> Result<String> {
+fn prompt_password(prompt: &str) -> Result<Zeroizing<String>> {
     print!("{prompt}");
     io::stdout().flush()?;
 
-    Ok(rpassword::read_password()?)
+    Ok(Zeroizing::new(rpassword::read_password()?))
 }

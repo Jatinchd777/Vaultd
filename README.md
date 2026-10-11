@@ -209,7 +209,7 @@ Credential value: ********
 
 That is the better habit. Typed inline, a secret lands in shell history and shows up in the process list while the command runs.
 
-**`passwd` never takes a password on the command line.** It asks for the current password, then the new one twice, with no echo, same as `init`. It re-encrypts everything under a fresh salt, so the old password stops working. If the vault is unlocked, `lock` first:
+**`passwd` never takes a password on the command line.** It asks for the current password, then the new one twice, with no echo, same as `init`. New passwords must be at least 12 characters and must not be one of the most common real-world passwords — the salt and KDF settings ship with the repo, so a weak password falls to offline guessing. It re-encrypts everything under a fresh salt, so the old password stops working. If the vault is unlocked, `lock` first:
 
 ```sh
 $ vaultd lock

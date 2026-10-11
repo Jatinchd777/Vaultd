@@ -102,6 +102,57 @@ fn unlock_missing_vault_file_fails() {
 }
 
 #[test]
+fn weak_vault_still_unlocks() {
+    use base64::Engine;
+    use vaultd::crypto::{
+        cipher,
+        kdf::{self, KdfParams},
+    };
+
+    if !have_zsh() {
+        eprintln!("skipping: zsh is required for the vault shell");
+        return;
+    }
+    // The password policy gates `init`/`passwd` only: a vault created
+    // earlier with a weak password must still open.
+    let env = Env::new("vault-weakpw");
+    let dir = env.project.path().join(".vaultd");
+    std::fs::create_dir_all(&dir).unwrap();
+    let params = KdfParams::generate().unwrap();
+    let key = kdf::derive_key(b"pw", &params).unwrap();
+    let manifest = serde_json::json!({
+        "version": 1,
+        "cipher": "AES-256-GCM",
+        "kdf": {
+            "algorithm": "Argon2id",
+            "salt": base64::engine::general_purpose::STANDARD.encode(params.salt),
+            "memory_cost": params.memory_cost,
+            "time_cost": params.time_cost,
+            "parallelism": params.parallelism,
+        },
+    });
+    std::fs::write(
+        dir.join("manifest"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let encrypted = cipher::encrypt(&key, b"[]").unwrap();
+    std::fs::write(dir.join("vault"), &encrypted).unwrap();
+
+    let mut shell = spawn_pty(&env, &["unlock"]);
+    shell.pty.read_until("Master password:", TIMEOUT);
+    shell.pty.send("pw\n");
+    let banner = shell.pty.read_until("Vault unlocked", TIMEOUT);
+    assert!(banner.contains("Vault unlocked"));
+    env.wait_for_socket(Duration::from_secs(30));
+
+    let _ = env.run(&["lock"], "");
+    env.wait_for_gone(&env.socket(), Duration::from_secs(10));
+    shell.pty.send("exit\n");
+    let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
+}
+
+#[test]
 fn full_session_roundtrip() {
     if !have_zsh() {
         eprintln!("skipping: zsh is required for the vault shell");
