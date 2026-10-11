@@ -1,8 +1,24 @@
 # Changelog
 
 All notable changes to vaultd are documented here. Entries mirror the
-GitHub releases (`v0.1.0` … `v0.4.0`); the top section tracks work not
+GitHub releases (`v0.1.0` … `vx.x.x`); the top section tracks work not
 yet released.
+
+## [v0.4.3]
+
+### Fixed
+- `vaultd lock` now terminates the vault shell it opened instead of
+  stopping only the daemon (`src/daemon/server.rs`): the daemon
+  signals the shell via its held `pidfd` (`SIGHUP`, wait `1s`, then
+  `SIGKILL` fallback — interactive `bash`/`zsh` ignore `SIGTERM`,
+  `fish` ignores both). Socket/token removal and vault drop happen
+  first, so secrets are unreachable before the shell dies. Locking
+  one project kills only its own shell.
+- Tests: new `lock_terminates_vault_shell` plus all `lock` cleanups
+  now assert auto-exit with no manual `exit`; suite 66 -> 67.
+
+No protocol change, existing sessions stay compatible. Lock and
+unlock once after updating.
 
 ## [v0.4.2]
 
