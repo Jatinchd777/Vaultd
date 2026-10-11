@@ -1,6 +1,6 @@
 [package]
 name = "vaultd"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Encrypted vault for local dev secrets that exist only while you work."
 license = "GPL-3.0-only"
