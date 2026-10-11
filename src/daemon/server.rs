@@ -1,12 +1,17 @@
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
         io::{AsRawFd, RawFd},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -14,13 +19,22 @@ use rand::TryRngCore;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
-use super::protocol::{AuthenticatedRequest, Request, Response};
+use super::protocol::{AuthenticatedRequest, MAX_MESSAGE_BYTES, Request, Response};
 use crate::storage::filesystem;
 use crate::vault::store::Vault;
 
 pub const SOCKET_ENV: &str = "VAULTD_SOCKET";
 pub const TOKEN_ENV: &str = "VAULTD_TOKEN";
 pub const TOKEN_BYTES: usize = 32;
+
+/// Bound each connection: slow or huge peers must not stall the daemon.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cap concurrent workers; beyond this the daemon replies `busy`.
+const MAX_WORKERS: usize = 16;
+/// Supervisor poll quantum: keeps `Lock` shutdown and thread reaping
+/// responsive without a wake pipe.
+const POLL_TIMEOUT_MS: i32 = 100;
 
 pub fn runtime_base_dir() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_RUNTIME_DIR") {
@@ -467,8 +481,8 @@ fn daemon_main(
         libc::close(ready_fd);
     }
 
-    let mut vault = vault;
-    let _reason = serve_loop(&listener, &mut vault, pidfd, expected_token)?;
+    let vault = Arc::new(Mutex::new(vault));
+    let _reason = serve_loop(&listener, Arc::clone(&vault), pidfd, expected_token)?;
 
     drop(listener);
     drop(vault);
@@ -486,13 +500,26 @@ enum ShutdownReason {
 
 fn serve_loop(
     listener: &UnixListener,
-    vault: &mut Vault,
+    vault: Arc<Mutex<Vault>>,
     pidfd: RawFd,
     expected_token: &[u8; TOKEN_BYTES],
 ) -> Result<ShutdownReason> {
+    let expected_token = *expected_token;
+    let lock_requested = Arc::new(AtomicBool::new(false));
+    let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let listener_fd = listener.as_raw_fd();
 
     loop {
+        // Reap finished workers so the vec stays bounded.
+        workers.retain(|h| !h.is_finished());
+
+        if lock_requested.load(Ordering::SeqCst) {
+            for h in std::mem::take(&mut workers) {
+                let _ = h.join();
+            }
+            return Ok(ShutdownReason::LockRequested);
+        }
+
         let mut fds = [
             libc::pollfd {
                 fd: listener_fd,
@@ -506,7 +533,8 @@ fn serve_loop(
             },
         ];
 
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        let ret =
+            unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, POLL_TIMEOUT_MS) };
 
         if ret < 0 {
             let err = std::io::Error::last_os_error();
@@ -521,10 +549,16 @@ fn serve_loop(
         // pidfd becomes readable when the monitored shell process exits.
         // This pins the exact shell opened before exec; no pid reuse race.
         if fds[1].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+            for h in std::mem::take(&mut workers) {
+                let _ = h.join();
+            }
             return Ok(ShutdownReason::ShellExited);
         }
 
         if fds[1].revents & libc::POLLNVAL != 0 {
+            for h in std::mem::take(&mut workers) {
+                let _ = h.join();
+            }
             return Ok(ShutdownReason::ShellExited);
         }
 
@@ -532,16 +566,23 @@ fn serve_loop(
             anyhow::bail!("daemon socket poll error");
         }
 
+        if ret == 0 {
+            continue;
+        }
+
         if fds[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let _ = stream.set_nonblocking(false);
-
-                    match handle_connection(stream, vault, expected_token) {
-                        Ok(true) => return Ok(ShutdownReason::LockRequested),
-                        Ok(false) => {}
-                        Err(_) => {}
+                    workers.retain(|h| !h.is_finished());
+                    if workers.len() >= MAX_WORKERS {
+                        reject_busy(stream);
+                        continue;
                     }
+                    let vault = Arc::clone(&vault);
+                    let flag = Arc::clone(&lock_requested);
+                    workers.push(std::thread::spawn(move || {
+                        let _ = handle_connection(stream, vault, &expected_token, &flag);
+                    }));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(_) => {}
@@ -550,11 +591,41 @@ fn serve_loop(
     }
 }
 
+/// Immediate `busy` reply when all worker slots are taken.
+/// Never blocks the supervisor loop.
+fn reject_busy(stream: UnixStream) {
+    let mut stream = stream;
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+    let _ = serde_json::to_writer(
+        &mut stream,
+        &Response::Error("vaultd daemon is busy".to_string()),
+    );
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+}
+
+fn read_envelope_capped(stream: &mut UnixStream) -> Result<AuthenticatedRequest> {
+    let mut buf = Vec::new();
+    let mut limited = stream.take((MAX_MESSAGE_BYTES + 1) as u64);
+    limited.read_to_end(&mut buf)?;
+    if buf.len() > MAX_MESSAGE_BYTES {
+        anyhow::bail!("vaultd request is too large");
+    }
+    Ok(serde_json::from_slice(&buf)?)
+}
+
 fn handle_connection(
-    mut stream: UnixStream,
-    vault: &mut Vault,
+    stream: UnixStream,
+    vault: Arc<Mutex<Vault>>,
     expected_token: &[u8; TOKEN_BYTES],
+    lock_requested: &AtomicBool,
 ) -> Result<bool> {
+    let mut stream = stream;
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+
     // Defense in depth: filesystem perms already restrict to our UID,
     // but verify explicitly so a misconfigured umask never opens the vault.
     if check_peer_uid(&stream).is_err() {
@@ -565,7 +636,7 @@ fn handle_connection(
         return Ok(false);
     }
 
-    let envelope: AuthenticatedRequest = serde_json::from_reader(&mut stream)?;
+    let envelope = read_envelope_capped(&mut stream)?;
     let presented = decode_token_hex(&envelope.token)
         .map_err(|_| anyhow::anyhow!("vaultd daemon authentication failed"))?;
     if !token_eq(&presented, expected_token) {
@@ -579,51 +650,62 @@ fn handle_connection(
     let request = envelope.request;
     let should_stop = matches!(request, Request::Lock);
 
-    let response = match request {
-        Request::Ping => Response::Pong,
+    // Hold the vault lock only while computing the response, never
+    // across network I/O.
+    let response = {
+        let mut vault = vault
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vaultd daemon is busy"))?;
+        match request {
+            Request::Ping => Response::Pong,
 
-        Request::List => {
-            let names = vault
-                .credentials()
-                .iter()
-                .map(|credential| credential.name.clone())
-                .collect();
+            Request::List => {
+                let names = vault
+                    .credentials()
+                    .iter()
+                    .map(|credential| credential.name.clone())
+                    .collect();
 
-            Response::CredentialNames(names)
-        }
+                Response::CredentialNames(names)
+            }
 
-        Request::Get { name } => match vault.get(&name) {
-            Ok(value) => Response::Credential {
-                name,
-                value: value.to_string(),
+            Request::Get { name } => match vault.get(&name) {
+                Ok(value) => Response::Credential {
+                    name,
+                    value: value.to_string(),
+                },
+
+                Err(error) => Response::Error(error.to_string()),
             },
 
-            Err(error) => Response::Error(error.to_string()),
-        },
+            Request::Add { name, value } => match vault.add(name, value) {
+                Ok(()) => Response::Success,
+                Err(error) => Response::Error(error.to_string()),
+            },
 
-        Request::Add { name, value } => match vault.add(name, value) {
-            Ok(()) => Response::Success,
-            Err(error) => Response::Error(error.to_string()),
-        },
+            Request::Set { name, value } => match vault.set(name, value) {
+                Ok(()) => Response::Success,
+                Err(error) => Response::Error(error.to_string()),
+            },
 
-        Request::Set { name, value } => match vault.set(name, value) {
-            Ok(()) => Response::Success,
-            Err(error) => Response::Error(error.to_string()),
-        },
+            Request::Remove { name } => match vault.remove(&name) {
+                Ok(()) => Response::Success,
+                Err(error) => Response::Error(error.to_string()),
+            },
 
-        Request::Remove { name } => match vault.remove(&name) {
-            Ok(()) => Response::Success,
-            Err(error) => Response::Error(error.to_string()),
-        },
+            Request::Environment => Response::Environment(vault.environment()),
 
-        Request::Environment => Response::Environment(vault.environment()),
-
-        Request::Lock => Response::Locked,
+            Request::Lock => Response::Locked,
+        }
     };
 
     serde_json::to_writer(&mut stream, &response)?;
 
     stream.shutdown(std::net::Shutdown::Write)?;
+
+    if should_stop {
+        lock_requested.store(true, Ordering::SeqCst);
+    }
 
     Ok(should_stop)
 }

@@ -1,20 +1,25 @@
-use std::{io::Read, os::unix::net::UnixStream};
+use std::{io::Read, os::unix::net::UnixStream, time::Duration};
 
 use anyhow::Result;
 
 use super::{
-    protocol::{AuthenticatedRequest, Request, Response},
+    protocol::{AuthenticatedRequest, MAX_MESSAGE_BYTES, Request, Response},
     server,
 };
+
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn request(body: Request) -> Result<Response> {
     let socket = server::socket_path()?;
     let token = server::load_client_token()?;
     let mut stream = UnixStream::connect(&socket)
         .map_err(|_| anyhow::anyhow!("vaultd daemon is not running"))?;
+    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
 
     // Verify we are talking to our own daemon before sending secrets.
-    // This blocks spoofed sockets owned by another UID.
+    // This blocks spoofed sockets owned by another UID. Fail closed:
+    // if the peer credentials cannot be queried, refuse to proceed.
     {
         use std::os::unix::io::AsRawFd;
         let fd = stream.as_raw_fd();
@@ -29,11 +34,12 @@ fn request(body: Request) -> Result<Response> {
                 &mut len,
             )
         };
-        if ret == 0 {
-            let own = unsafe { libc::getuid() };
-            if cred.uid != own {
-                anyhow::bail!("vaultd daemon authentication failed");
-            }
+        if ret != 0 {
+            anyhow::bail!("vaultd daemon authentication failed");
+        }
+        let own = unsafe { libc::getuid() };
+        if cred.uid != own {
+            anyhow::bail!("vaultd daemon authentication failed");
         }
     }
 
@@ -46,8 +52,11 @@ fn request(body: Request) -> Result<Response> {
     stream.shutdown(std::net::Shutdown::Write)?;
 
     let mut response_bytes = Vec::new();
-
-    stream.read_to_end(&mut response_bytes)?;
+    let mut limited = stream.take((MAX_MESSAGE_BYTES + 1) as u64);
+    limited.read_to_end(&mut response_bytes)?;
+    if response_bytes.len() > MAX_MESSAGE_BYTES {
+        anyhow::bail!("vaultd response is too large");
+    }
 
     Ok(serde_json::from_slice(&response_bytes)?)
 }

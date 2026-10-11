@@ -324,3 +324,164 @@ fn wrong_token_is_rejected() {
     shell.pty.send("exit\n");
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
 }
+
+#[test]
+fn slow_loris_does_not_block_others() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    if !have_zsh() {
+        eprintln!("skipping: zsh is required for the vault shell");
+        return;
+    }
+    let env = Env::new("daemon-slow-loris");
+    init_vault(&env, PASSWORD);
+    let mut shell = spawn_pty(&env, &["unlock"]);
+    shell.pty.read_until("Master password:", TIMEOUT);
+    shell.pty.send(&format!("{PASSWORD}\n"));
+    shell.pty.read_until("Vault unlocked", TIMEOUT);
+    env.wait_for_socket(Duration::from_secs(30));
+
+    // Hold a connection open with a partial message and never finish it.
+    let mut loris = UnixStream::connect(env.socket()).expect("connect loris");
+    loris
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    loris
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    loris.write_all(b"{\"token\":").expect("partial write");
+
+    // A second client must still be served promptly.
+    let start = std::time::Instant::now();
+    let out = env.run(&["list"], "");
+    assert!(out.status.success(), "list blocked: {}", stderr(&out));
+    assert!(
+        start.elapsed() < Duration::from_secs(30),
+        "list stalled behind slow peer ({:?})",
+        start.elapsed()
+    );
+    let out = env.run(&["add", "SLOWPROBE", "v"], "");
+    assert!(out.status.success(), "add blocked: {}", stderr(&out));
+    drop(loris);
+
+    let _ = env.run(&["lock"], "");
+    env.wait_for_gone(&env.socket(), Duration::from_secs(10));
+    shell.pty.send("exit\n");
+    let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
+}
+
+#[test]
+fn oversized_request_is_rejected_without_hang() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    if !have_zsh() {
+        eprintln!("skipping: zsh is required for the vault shell");
+        return;
+    }
+    let env = Env::new("daemon-oversize");
+    init_vault(&env, PASSWORD);
+    let mut shell = spawn_pty(&env, &["unlock"]);
+    shell.pty.read_until("Master password:", TIMEOUT);
+    shell.pty.send(&format!("{PASSWORD}\n"));
+    shell.pty.read_until("Vault unlocked", TIMEOUT);
+    env.wait_for_socket(Duration::from_secs(30));
+
+    let sock = env.socket();
+    let token_path = server::token_path_for_socket(&sock);
+    let token = std::fs::read_to_string(&token_path).expect("token file");
+    let big_value = "x".repeat(2 * 1024 * 1024);
+    let payload = serde_json::json!({
+        "token": token.trim(),
+        "request": {"Add": {"name": "BIG", "value": big_value}},
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap();
+    assert!(bytes.len() > vaultd::daemon::protocol::MAX_MESSAGE_BYTES);
+
+    let mut stream = UnixStream::connect(&sock).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    // The daemon closes oversized requests early; either a clean Error
+    // frame or a reset/EOF counts as rejection as long as we don't hang.
+    let mut response = Vec::new();
+    let write_result = stream.write_all(&bytes);
+    if write_result.is_ok() {
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut buf = [0u8; 8192];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(_) => break,
+            }
+            if response.len() > 8192 {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            response.is_empty() || text.contains("too large") || text.contains("Error"),
+            "unexpected oversize response: {text:?}"
+        );
+    }
+    drop(stream);
+
+    // Daemon must still serve legitimate requests afterwards.
+    let out = env.run(&["list"], "");
+    assert!(out.status.success(), "daemon wedged: {}", stderr(&out));
+
+    let _ = env.run(&["lock"], "");
+    env.wait_for_gone(&env.socket(), Duration::from_secs(10));
+    shell.pty.send("exit\n");
+    let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
+}
+
+#[test]
+fn concurrent_adds_all_succeed() {
+    if !have_zsh() {
+        eprintln!("skipping: zsh is required for the vault shell");
+        return;
+    }
+    let env = Env::new("daemon-concurrent");
+    init_vault(&env, PASSWORD);
+    let mut shell = spawn_pty(&env, &["unlock"]);
+    shell.pty.read_until("Master password:", TIMEOUT);
+    shell.pty.send(&format!("{PASSWORD}\n"));
+    shell.pty.read_until("Vault unlocked", TIMEOUT);
+    env.wait_for_socket(Duration::from_secs(30));
+
+    std::thread::scope(|s| {
+        let env_ref = &env;
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            handles.push(s.spawn(move || {
+                let out = env_ref.run(&["add", &format!("C{i}"), &format!("v{i}")], "");
+                assert!(out.status.success(), "add C{i} failed: {}", stderr(&out));
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+    });
+
+    let out = env.run(&["list"], "");
+    assert!(out.status.success(), "list failed: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("16 credentials"), "missing names:\n{text}");
+
+    let _ = env.run(&["lock"], "");
+    env.wait_for_gone(&env.socket(), Duration::from_secs(10));
+    shell.pty.send("exit\n");
+    let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
+}

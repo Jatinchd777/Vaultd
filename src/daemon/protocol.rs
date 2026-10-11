@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+/// Upper bound for a single IPC message in either direction.
+/// Caps memory use when reading from a peer that may be malicious
+/// (any process running as our UID can connect).
+pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     Ping,
