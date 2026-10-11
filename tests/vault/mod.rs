@@ -420,8 +420,14 @@ fn env_export_format_and_escaping() {
         text.contains("export TRICKY='a'\\''b \"c\" $d'"),
         "bad escaping:\n{text}"
     );
-    assert!(text.contains("_VAULTD_EXPORTED="), "missing export list:\n{text}");
-    assert!(text.contains("vaultd-clear()"), "missing clear fn:\n{text}");
+    assert!(
+        !text.contains("_VAULTD_EXPORTED="),
+        "dead export list:\n{text}"
+    );
+    assert!(
+        !text.contains("vaultd-clear()"),
+        "dead clear fn:\n{text}"
+    );
     // Token is 64 hex chars.
     let token_line = text
         .lines()

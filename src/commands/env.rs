@@ -26,28 +26,7 @@ pub fn run() -> Result<()> {
         println!("export {name}={}", shell_escape(value));
     }
 
-    if !environment.is_empty() {
-        println!();
-        println!("export _VAULTD_EXPORTED='{}'", exported_names(&environment));
-        println!();
-        println!("vaultd-clear() {{");
-        println!("    local name");
-        println!("    for name in $_VAULTD_EXPORTED; do");
-        println!("        unset \"$name\"");
-        println!("    done");
-        println!("    unset _VAULTD_EXPORTED");
-        println!("}}");
-    }
-
     Ok(())
-}
-
-fn exported_names(environment: &[(String, String)]) -> String {
-    environment
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn valid_name(name: &str) -> bool {
