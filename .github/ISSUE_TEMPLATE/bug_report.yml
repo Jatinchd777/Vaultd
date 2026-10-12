@@ -1,0 +1,70 @@
+name: Bug report
+description: Public bugs only. No secrets, no vulnerabilities (see SECURITY.md).
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste secrets, tokens, or passwords. Use `xxx` for values.
+        For vulnerabilities use Security Advisories, not this form.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      placeholder: vaultd list fails inside vault shell with ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce?
+      description: Exact commands from init to failure.
+      placeholder: |
+        vaultd init
+        vaultd unlock
+        vaultd add FOO bar
+        vaultd get FOO
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual?
+      placeholder: Expected `value`, got `authentication failed`.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: vaultd version?
+      placeholder: vaultd --version
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: OS / shell / install?
+      placeholder: Arch Linux, zsh, cargo install vaultd
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs? (redacted)
+      description: stderr output with secrets replaced by xxx.
+      render: shell
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: No secrets or tokens pasted
+          required: true
+        - label: Searched existing issues
+          required: false
+        - label: Tried lock + unlock again
+          required: false
