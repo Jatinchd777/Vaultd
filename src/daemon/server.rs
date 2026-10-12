@@ -221,10 +221,12 @@ fn validate_env_socket_path(path: &Path) -> Result<()> {
     let runtime_canon = std::fs::canonicalize(&runtime_base).unwrap_or(runtime_base);
     // Resolve the parent (socket itself may not exist yet for the daemon).
     let parent = path.parent().unwrap_or(Path::new("."));
-    let parent_canon =
-        std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    let parent_canon = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
     if parent_canon != runtime_canon {
-        anyhow::bail!("untrusted VAULTD_SOCKET: must live inside {}", runtime_canon.display());
+        anyhow::bail!(
+            "untrusted VAULTD_SOCKET: must live inside {}",
+            runtime_canon.display()
+        );
     }
     if path.as_os_str().as_encoded_bytes().len() >= 108 {
         anyhow::bail!("vaultd socket path too long for {}", path.display());
@@ -311,11 +313,11 @@ fn token_eq(a: &[u8; TOKEN_BYTES], b: &[u8; TOKEN_BYTES]) -> bool {
 }
 
 fn write_token_file(path: &Path, token: &[u8; TOKEN_BYTES]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
     }
     let hex = encode_token_hex(token);
     let mut opts = fs::OpenOptions::new();
@@ -349,12 +351,22 @@ pub fn load_client_token() -> Result<[u8; TOKEN_BYTES]> {
         }
     }
     let path = current_project_token_path()?;
-    let raw = fs::read_to_string(&path).map_err(|_| anyhow::anyhow!("vaultd daemon is not running"))?;
+    let raw =
+        fs::read_to_string(&path).map_err(|_| anyhow::anyhow!("vaultd daemon is not running"))?;
     decode_token_hex(&raw).map_err(|_| anyhow::anyhow!("vaultd daemon is not running"))
 }
 
-/// UID of the peer on a Unix socket via `SO_PEERCRED`.
-fn peer_uid(stream: &UnixStream) -> Result<u32> {
+/// Shell subtree identity: the vault shell pid plus its starttime.
+/// `exec` keeps both, so the pre-`exec` unlock pid identifies the
+/// post-`exec` shell. Starttime pins the exact process, no pid-reuse race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShellIdentity {
+    pub pid: i32,
+    pub starttime: u64,
+}
+
+/// Credentials of the peer on a Unix socket via `SO_PEERCRED`.
+fn peer_cred(stream: &UnixStream) -> Result<libc::ucred> {
     let fd = stream.as_raw_fd();
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -368,15 +380,97 @@ fn peer_uid(stream: &UnixStream) -> Result<u32> {
         )
     };
     if ret != 0 {
-        anyhow::bail!("failed to query peer credentials: {}", std::io::Error::last_os_error());
+        anyhow::bail!(
+            "failed to query peer credentials: {}",
+            std::io::Error::last_os_error()
+        );
     }
-    Ok(cred.uid)
+    Ok(cred)
 }
 
-fn check_peer_uid(stream: &UnixStream) -> Result<()> {
-    let peer = peer_uid(stream)?;
+fn check_peer_uid(stream: &UnixStream) -> Result<libc::ucred> {
+    let cred = peer_cred(stream)?;
     let own = unsafe { libc::getuid() };
-    if peer != own {
+    if cred.uid != own {
+        anyhow::bail!("vaultd daemon authentication failed");
+    }
+    Ok(cred)
+}
+
+/// Parse `/proc/<pid>/stat`: returns `(ppid, starttime)`.
+/// `comm` may contain spaces/parens, so split after the last `)`.
+fn proc_ppid_and_starttime(pid: i32) -> Result<(i32, u64)> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|_| anyhow::anyhow!("vaultd daemon authentication failed"))?;
+    let rparen = text
+        .rfind(')')
+        .ok_or_else(|| anyhow::anyhow!("vaultd daemon authentication failed"))?;
+    let after = text[rparen + 2..].split_whitespace().collect::<Vec<_>>();
+    // after[0]=state(3), after[1]=ppid(4), ..., after[19]=starttime(22).
+    if after.len() <= 19 {
+        anyhow::bail!("vaultd daemon authentication failed");
+    }
+    let ppid: i32 = after[1]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("vaultd daemon authentication failed"))?;
+    let starttime: u64 = after[19]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("vaultd daemon authentication failed"))?;
+    Ok((ppid, starttime))
+}
+
+fn proc_starttime(pid: i32) -> Result<u64> {
+    Ok(proc_ppid_and_starttime(pid)?.1)
+}
+
+/// Identity of the current process for subtree checks (exposed for tests).
+pub fn current_process_identity() -> Result<ShellIdentity> {
+    let pid = unsafe { libc::getpid() };
+    Ok(ShellIdentity {
+        pid,
+        starttime: proc_starttime(pid)?,
+    })
+}
+
+/// `true` when `peer` is the shell itself or a descendant.
+/// Walks `ppid` up to `init`; the final shell-pid match also requires
+/// starttime equality so a recycled pid never passes. Fail closed.
+pub fn is_in_shell_subtree(peer_pid: i32, shell: ShellIdentity) -> bool {
+    if peer_pid <= 0 || shell.pid <= 0 {
+        return false;
+    }
+    // Fast path: peer is the shell itself.
+    if peer_pid == shell.pid {
+        return proc_starttime(peer_pid).is_ok_and(|t| t == shell.starttime);
+    }
+    // Verify the shell root is still the same process we started.
+    if proc_starttime(shell.pid).is_ok_and(|t| t != shell.starttime) {
+        return false;
+    }
+    let mut current = peer_pid;
+    for _ in 0..64 {
+        let ppid = match proc_ppid_and_starttime(current) {
+            Ok((ppid, _)) => ppid,
+            Err(_) => return false,
+        };
+        if ppid == shell.pid {
+            return proc_starttime(shell.pid).is_ok_and(|t| t == shell.starttime);
+        }
+        if ppid <= 1 {
+            return false;
+        }
+        // Cycle guard: ppid must make progress toward init.
+        if ppid == current {
+            return false;
+        }
+        current = ppid;
+    }
+    false
+}
+
+fn check_shell_subtree(stream: &UnixStream, shell: &ShellIdentity, peer_pid: i32) -> Result<()> {
+    let _ = stream;
+    if !is_in_shell_subtree(peer_pid, *shell) {
         anyhow::bail!("vaultd daemon authentication failed");
     }
     Ok(())
@@ -400,12 +494,12 @@ pub fn is_running() -> Result<bool> {
         Ok(_) => Ok(true),
         Err(_) => {
             // Only remove stale filesystem sockets, never symlinks.
-            if let Ok(meta) = fs::symlink_metadata(&path) {
-                if !meta.file_type().is_symlink() {
-                    let _ = fs::remove_file(&path);
-                    // Best-effort stale token cleanup alongside the socket.
-                    let _ = fs::remove_file(token_path_for_socket(&path));
-                }
+            if let Ok(meta) = fs::symlink_metadata(&path)
+                && !meta.file_type().is_symlink()
+            {
+                let _ = fs::remove_file(&path);
+                // Best-effort stale token cleanup alongside the socket.
+                let _ = fs::remove_file(token_path_for_socket(&path));
             }
             Ok(false)
         }
@@ -417,6 +511,15 @@ pub fn spawn_daemon_and_shell(vault: Vault, socket_path: PathBuf) -> Result<()> 
     // fast without starting a daemon that would immediately shut down.
     let shell = detect_shell()?;
     let session_token = generate_session_token()?;
+    // The unlock pid becomes the vault shell pid after `exec`
+    // (same pid + starttime), so capture it now for subtree auth.
+    let shell_pid = unsafe { libc::getpid() };
+    let shell_starttime =
+        proc_starttime(shell_pid).map_err(|_| anyhow::anyhow!("failed to query shell identity"))?;
+    let shell_identity = ShellIdentity {
+        pid: shell_pid,
+        starttime: shell_starttime,
+    };
     let mut pipe_fds = [0 as libc::c_int; 2];
 
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
@@ -428,7 +531,7 @@ pub fn spawn_daemon_and_shell(vault: Vault, socket_path: PathBuf) -> Result<()> 
         libc::fcntl(pipe_fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
     }
 
-    let parent_pid = unsafe { libc::getpid() };
+    let parent_pid = shell_identity.pid;
     let pid = unsafe { libc::fork() };
 
     if pid < 0 {
@@ -471,7 +574,14 @@ pub fn spawn_daemon_and_shell(vault: Vault, socket_path: PathBuf) -> Result<()> 
         }
 
         let path = socket_path;
-        let result = daemon_main(vault, pidfd, pipe_fds[1], &path, &session_token);
+        let result = daemon_main(
+            vault,
+            pidfd,
+            pipe_fds[1],
+            &path,
+            &session_token,
+            shell_identity,
+        );
 
         unsafe {
             libc::close(pidfd);
@@ -542,6 +652,7 @@ fn daemon_main(
     ready_fd: RawFd,
     path: &Path,
     expected_token: &[u8; TOKEN_BYTES],
+    shell_identity: ShellIdentity,
 ) -> Result<()> {
     detach_standard_streams();
 
@@ -623,7 +734,13 @@ fn daemon_main(
     }
 
     let vault = Arc::new(Mutex::new(vault));
-    let reason = match serve_loop(&listener, Arc::clone(&vault), pidfd, expected_token) {
+    let reason = match serve_loop(
+        &listener,
+        Arc::clone(&vault),
+        pidfd,
+        expected_token,
+        shell_identity,
+    ) {
         Ok(reason) => reason,
         Err(error) => {
             drop(listener);
@@ -674,6 +791,7 @@ fn serve_loop(
     vault: Arc<Mutex<Vault>>,
     pidfd: RawFd,
     expected_token: &[u8; TOKEN_BYTES],
+    shell_identity: ShellIdentity,
 ) -> Result<ShutdownReason> {
     let expected_token = *expected_token;
     let lock_requested = Arc::new(AtomicBool::new(false));
@@ -752,7 +870,13 @@ fn serve_loop(
                     let vault = Arc::clone(&vault);
                     let flag = Arc::clone(&lock_requested);
                     workers.push(std::thread::spawn(move || {
-                        let _ = handle_connection(stream, vault, &expected_token, &flag);
+                        let _ = handle_connection(
+                            stream,
+                            vault,
+                            &expected_token,
+                            &flag,
+                            shell_identity,
+                        );
                     }));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -791,6 +915,7 @@ fn handle_connection(
     vault: Arc<Mutex<Vault>>,
     expected_token: &[u8; TOKEN_BYTES],
     lock_requested: &AtomicBool,
+    shell_identity: ShellIdentity,
 ) -> Result<bool> {
     let mut stream = stream;
     let _ = stream.set_nonblocking(false);
@@ -799,7 +924,32 @@ fn handle_connection(
 
     // Defense in depth: filesystem perms already restrict to our UID,
     // but verify explicitly so a misconfigured umask never opens the vault.
-    if check_peer_uid(&stream).is_err() {
+    let peer_pid = match check_peer_uid(&stream) {
+        Ok(cred) => cred.pid,
+        Err(_) => {
+            let _ = serde_json::to_writer(
+                &mut stream,
+                &Response::Error("vaultd daemon authentication failed".to_string()),
+            );
+            return Ok(false);
+        }
+    };
+
+    // Drain the request first so early rejection doesn't RST the peer
+    // with unread bytes (outsider would see reset instead of auth failed).
+    let envelope = match read_envelope_capped(&mut stream) {
+        Ok(env) => env,
+        Err(_) => {
+            let _ = serde_json::to_writer(
+                &mut stream,
+                &Response::Error("vaultd daemon authentication failed".to_string()),
+            );
+            return Ok(false);
+        }
+    };
+    // Then bind to the vault-shell subtree: only the shell itself and its
+    // descendants may use the daemon, even with a valid token.
+    if check_shell_subtree(&stream, &shell_identity, peer_pid).is_err() {
         let _ = serde_json::to_writer(
             &mut stream,
             &Response::Error("vaultd daemon authentication failed".to_string()),
@@ -807,7 +957,6 @@ fn handle_connection(
         return Ok(false);
     }
 
-    let envelope = read_envelope_capped(&mut stream)?;
     let presented = decode_token_hex(&envelope.token)
         .map_err(|_| anyhow::anyhow!("vaultd daemon authentication failed"))?;
     if !token_eq(&presented, expected_token) {

@@ -94,10 +94,7 @@ fn reject_symlink(path: &Path) -> anyhow::Result<()> {
     if let Ok(meta) = fs::symlink_metadata(path)
         && meta.file_type().is_symlink()
     {
-        anyhow::bail!(
-            "refusing to follow symlink at {}",
-            path.display()
-        );
+        anyhow::bail!("refusing to follow symlink at {}", path.display());
     }
     Ok(())
 }

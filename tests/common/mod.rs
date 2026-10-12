@@ -539,3 +539,61 @@ pub fn spawn_pty_with_extra(env: &Env, args: &[&str], extra: &[(&str, &str)]) ->
     let child = cmd.spawn().expect("failed to spawn vaultd");
     PtySession { child, pty }
 }
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Run `vaultd <args>` as a child of the vault shell (so it passes the
+/// subtree gate), capturing stdout/stderr/exit via temp files.
+/// Works for bash/zsh/fish: outer uses `sh -c` for portability.
+pub fn run_in_shell(shell: &mut PtySession, args: &[&str]) -> Output {
+    use std::os::unix::process::ExitStatusExt;
+    let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let tmp = std::env::temp_dir();
+    let out_path = tmp.join(format!("vaultd-sh-{}-{id}.out", std::process::id()));
+    let err_path = tmp.join(format!("vaultd-sh-{}-{id}.err", std::process::id()));
+    let code_path = tmp.join(format!("vaultd-sh-{}-{id}.code", std::process::id()));
+    let bin = binary().to_string_lossy().into_owned();
+
+    let mut inner = format!("{}", shell_quote(&bin),);
+    for a in args {
+        inner.push(' ');
+        inner.push_str(&shell_quote(a));
+    }
+    inner.push_str(&format!(
+        " > {} 2> {}; echo $? > {}",
+        shell_quote(&out_path.to_string_lossy()),
+        shell_quote(&err_path.to_string_lossy()),
+        shell_quote(&code_path.to_string_lossy()),
+    ));
+    let outer = format!("sh -c {} ; echo VAULTD_DONE_{id}", shell_quote(&inner),);
+    shell.pty.send(&format!("{outer}\n"));
+    // Drain pty until our marker appears (also prevents pty buffer stall).
+    let _ = shell.pty.read_until(&format!("VAULTD_DONE_{id}"), TIMEOUT);
+
+    let start = Instant::now();
+    loop {
+        if code_path.exists() {
+            break;
+        }
+        if start.elapsed() >= TIMEOUT {
+            panic!("timed out waiting for vaultd {args:?} in shell");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Small beat for file flush.
+    std::thread::sleep(Duration::from_millis(100));
+    let stdout = std::fs::read(&out_path).unwrap_or_default();
+    let stderr = std::fs::read(&err_path).unwrap_or_default();
+    let code_txt = std::fs::read_to_string(&code_path).unwrap_or_else(|_| "1".to_string());
+    let code: i32 = code_txt.trim().parse().unwrap_or(1);
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&err_path);
+    let _ = std::fs::remove_file(&code_path);
+    Output {
+        status: ExitStatusExt::from_raw((code << 8) as i32),
+        stdout,
+        stderr,
+    }
+}

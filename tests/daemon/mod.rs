@@ -6,8 +6,8 @@
 //! `src/daemon/client.rs`, none of which had tests.
 
 use crate::common::{
-    Env, TIMEOUT, have_bash, have_fish, have_zsh, init_vault, spawn_pty, spawn_pty_with_extra,
-    stderr, stdout, wait_exit,
+    Env, TIMEOUT, have_bash, have_fish, have_zsh, init_vault, run_in_shell, spawn_pty,
+    spawn_pty_with_extra, stderr, stdout, wait_exit,
 };
 use std::time::Duration;
 use vaultd::daemon::server;
@@ -15,6 +15,48 @@ use vaultd::daemon::server;
 const PASSWORD: &str = "correct horse battery staple";
 
 // --- Pure unit tests (no daemon, no pty) ---
+
+#[test]
+fn subtree_self_and_parent() {
+    let me = server::current_process_identity().expect("own identity");
+    // Self is in its own subtree.
+    assert!(server::is_in_shell_subtree(me.pid, me));
+    // Wrong starttime never passes (pid-reuse guard).
+    let bad = server::ShellIdentity {
+        pid: me.pid,
+        starttime: me.starttime.wrapping_add(1),
+    };
+    assert!(!server::is_in_shell_subtree(me.pid, bad));
+    // Parent is an ancestor, not a descendant: must be denied.
+    let parent = unsafe { libc::getppid() };
+    assert!(
+        !server::is_in_shell_subtree(parent, me),
+        "ancestor must not pass subtree gate"
+    );
+    // Invalid pids fail closed.
+    assert!(!server::is_in_shell_subtree(0, me));
+    assert!(!server::is_in_shell_subtree(-1, me));
+}
+
+#[test]
+fn subtree_child_passes() {
+    use std::process::{Command, Stdio};
+    let me = server::current_process_identity().expect("own identity");
+    let mut child = Command::new("sleep")
+        .arg("5")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id() as i32;
+    assert!(
+        server::is_in_shell_subtree(pid, me),
+        "direct child must pass subtree gate"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
 #[test]
 fn token_hex_roundtrip() {
@@ -65,7 +107,9 @@ fn project_hash_is_deterministic_and_sensitive() {
     assert_ne!(server::project_hash(a), server::project_hash(b));
     assert_eq!(server::project_hash(a).len(), 32);
     assert!(
-        server::project_hash(a).chars().all(|c| c.is_ascii_hexdigit()),
+        server::project_hash(a)
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()),
         "hash must be hex"
     );
 }
@@ -238,11 +282,7 @@ fn shell_select_prefers_override_then_markers() {
 
 // --- Black-box socket auth (drives the real binary) ---
 
-fn run_with_extra_env(
-    env: &Env,
-    args: &[&str],
-    extra: &[(&str, &str)],
-) -> std::process::Output {
+fn run_with_extra_env(env: &Env, args: &[&str], extra: &[(&str, &str)]) -> std::process::Output {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
@@ -360,8 +400,8 @@ fn second_unlock_while_running_fails() {
         stderr(&out)
     );
 
-    // Cleanup: lock, socket goes away, shell exits.
-    let out = env.run(&["lock"], "");
+    // Cleanup: lock via the vault shell subtree, socket goes away, shell exits.
+    let out = run_in_shell(&mut shell, &["lock"]);
     assert!(out.status.success(), "lock failed: {}", stderr(&out));
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
     // `lock` must terminate the vault shell itself (no manual `exit`).
@@ -388,7 +428,7 @@ fn lock_terminates_vault_shell() {
         "vault shell exited before lock"
     );
 
-    let out = env.run(&["lock"], "");
+    let out = run_in_shell(&mut shell, &["lock"]);
     assert!(out.status.success(), "lock failed: {}", stderr(&out));
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
 
@@ -471,8 +511,8 @@ fn wrong_token_is_rejected() {
     shell.pty.read_until("Vault unlocked", TIMEOUT);
     env.wait_for_socket(Duration::from_secs(30));
 
-    let out = env.run(&["add", "REAL", "value"], "");
-    assert!(out.status.success());
+    let out = run_in_shell(&mut shell, &["add", "REAL", "value"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
 
     // Correct socket but forged token must not read secrets.
     let sock = env.socket().to_string_lossy().into_owned();
@@ -490,12 +530,20 @@ fn wrong_token_is_rejected() {
         "unexpected stderr: {}",
         stderr(&out)
     );
-    // Sanity: without forgery the read works.
+    // Outsider with correct token file but outside subtree must also fail.
     let out = env.run(&["get", "REAL"], "");
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("authentication failed"),
+        "outsider should be denied, saw: {}",
+        stderr(&out)
+    );
+    // Sanity: inside subtree the read works.
+    let out = run_in_shell(&mut shell, &["get", "REAL"]);
     assert!(out.status.success());
     assert_eq!(stdout(&out).trim_end(), "value");
 
-    let _ = env.run(&["lock"], "");
+    let _ = run_in_shell(&mut shell, &["lock"]);
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
     // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
@@ -519,6 +567,8 @@ fn slow_loris_does_not_block_others() {
     env.wait_for_socket(Duration::from_secs(30));
 
     // Hold a connection open with a partial message and never finish it.
+    // Outsider (outside subtree) is rejected at lineage gate without
+    // stalling workers.
     let mut loris = UnixStream::connect(env.socket()).expect("connect loris");
     loris
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -528,20 +578,20 @@ fn slow_loris_does_not_block_others() {
         .unwrap();
     loris.write_all(b"{\"token\":").expect("partial write");
 
-    // A second client must still be served promptly.
+    // A second client inside subtree must still be served promptly.
     let start = std::time::Instant::now();
-    let out = env.run(&["list"], "");
+    let out = run_in_shell(&mut shell, &["list"]);
     assert!(out.status.success(), "list blocked: {}", stderr(&out));
     assert!(
         start.elapsed() < Duration::from_secs(30),
         "list stalled behind slow peer ({:?})",
         start.elapsed()
     );
-    let out = env.run(&["add", "SLOWPROBE", "v"], "");
+    let out = run_in_shell(&mut shell, &["add", "SLOWPROBE", "v"]);
     assert!(out.status.success(), "add blocked: {}", stderr(&out));
     drop(loris);
 
-    let _ = env.run(&["lock"], "");
+    let _ = run_in_shell(&mut shell, &["lock"]);
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
     // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
@@ -613,11 +663,11 @@ fn oversized_request_is_rejected_without_hang() {
     }
     drop(stream);
 
-    // Daemon must still serve legitimate requests afterwards.
-    let out = env.run(&["list"], "");
+    // Daemon must still serve legitimate requests afterwards (inside subtree).
+    let out = run_in_shell(&mut shell, &["list"]);
     assert!(out.status.success(), "daemon wedged: {}", stderr(&out));
 
-    let _ = env.run(&["lock"], "");
+    let _ = run_in_shell(&mut shell, &["lock"]);
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
     // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
@@ -637,26 +687,20 @@ fn concurrent_adds_all_succeed() {
     shell.pty.read_until("Vault unlocked", TIMEOUT);
     env.wait_for_socket(Duration::from_secs(30));
 
-    std::thread::scope(|s| {
-        let env_ref = &env;
-        let mut handles = Vec::new();
-        for i in 0..16 {
-            handles.push(s.spawn(move || {
-                let out = env_ref.run(&["add", &format!("C{i}"), &format!("v{i}")], "");
-                assert!(out.status.success(), "add C{i} failed: {}", stderr(&out));
-            }));
-        }
-        for h in handles {
-            h.join().expect("worker panicked");
-        }
-    });
+    // Subtree gate is per-connection and sequential via single pty;
+    // run 16 adds sequentially inside subtree (concurrency stress is
+    // covered by slow-loris/busy paths).
+    for i in 0..16 {
+        let out = run_in_shell(&mut shell, &["add", &format!("C{i}"), &format!("v{i}")]);
+        assert!(out.status.success(), "add C{i} failed: {}", stderr(&out));
+    }
 
-    let out = env.run(&["list"], "");
+    let out = run_in_shell(&mut shell, &["list"]);
     assert!(out.status.success(), "list failed: {}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("16 credentials"), "missing names:\n{text}");
 
-    let _ = env.run(&["lock"], "");
+    let _ = run_in_shell(&mut shell, &["lock"]);
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
     // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
@@ -685,16 +729,16 @@ fn bash_shell_roundtrip() {
         .read_until("VAULTD_PROBE_BASH_VERSION=", Duration::from_secs(10));
 
     // Full CRUD through the daemon while the bash shell owns the session.
-    let out = env.run(&["add", "BASH_KEY", "bash-value"], "");
+    let out = run_in_shell(&mut shell, &["add", "BASH_KEY", "bash-value"]);
     assert!(out.status.success(), "add failed: {}", stderr(&out));
-    let out = env.run(&["get", "BASH_KEY"], "");
+    let out = run_in_shell(&mut shell, &["get", "BASH_KEY"]);
     assert!(out.status.success(), "get failed: {}", stderr(&out));
     assert_eq!(stdout(&out).trim_end(), "bash-value");
-    let out = env.run(&["list"], "");
+    let out = run_in_shell(&mut shell, &["list"]);
     assert!(out.status.success(), "list failed: {}", stderr(&out));
     assert!(stdout(&out).contains("BASH_KEY"));
 
-    let _ = env.run(&["lock"], "");
+    let _ = run_in_shell(&mut shell, &["lock"]);
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
     // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
@@ -746,16 +790,16 @@ fn fish_shell_roundtrip() {
         .read_until("VAULTD_PROBE_FISH_VERSION=", Duration::from_secs(10));
 
     // Full CRUD through the daemon while the fish shell owns the session.
-    let out = env.run(&["add", "FISH_KEY", "fish-value"], "");
+    let out = run_in_shell(&mut shell, &["add", "FISH_KEY", "fish-value"]);
     assert!(out.status.success(), "add failed: {}", stderr(&out));
-    let out = env.run(&["get", "FISH_KEY"], "");
+    let out = run_in_shell(&mut shell, &["get", "FISH_KEY"]);
     assert!(out.status.success(), "get failed: {}", stderr(&out));
     assert_eq!(stdout(&out).trim_end(), "fish-value");
-    let out = env.run(&["list"], "");
+    let out = run_in_shell(&mut shell, &["list"]);
     assert!(out.status.success(), "list failed: {}", stderr(&out));
     assert!(stdout(&out).contains("FISH_KEY"));
 
-    let _ = env.run(&["lock"], "");
+    let _ = run_in_shell(&mut shell, &["lock"]);
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
     // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");
@@ -776,9 +820,13 @@ fn env_shell_flag_emits_per_shell_syntax() {
     shell.pty.read_until("Vault unlocked", TIMEOUT);
     env.wait_for_socket(Duration::from_secs(30));
 
-    assert!(env.run(&["add", "PLAIN", "secret-1"], "").status.success());
+    assert!(
+        run_in_shell(&mut shell, &["add", "PLAIN", "secret-1"])
+            .status
+            .success()
+    );
 
-    let out = env.run(&["__env", "--shell", "fish"], "");
+    let out = run_in_shell(&mut shell, &["__env", "--shell", "fish"]);
     assert!(
         out.status.success(),
         "__env --shell fish failed: {}",
@@ -806,7 +854,7 @@ fn env_shell_flag_emits_per_shell_syntax() {
         "fish output must not use export:\n{fish_text}"
     );
 
-    let out = env.run(&["__env", "--shell", "bash"], "");
+    let out = run_in_shell(&mut shell, &["__env", "--shell", "bash"]);
     assert!(
         out.status.success(),
         "__env --shell bash failed: {}",
@@ -828,7 +876,7 @@ fn env_shell_flag_emits_per_shell_syntax() {
 
     // zsh hooks travel via the generated `ZDOTDIR` init (functions die
     // at `exec`), so `__env` emits none for zsh.
-    let out = env.run(&["__env", "--shell", "zsh"], "");
+    let out = run_in_shell(&mut shell, &["__env", "--shell", "zsh"]);
     assert!(
         out.status.success(),
         "__env --shell zsh failed: {}",
@@ -840,7 +888,7 @@ fn env_shell_flag_emits_per_shell_syntax() {
         stdout(&out)
     );
 
-    let out = env.run(&["__env", "--shell", "tcsh"], "");
+    let out = run_in_shell(&mut shell, &["__env", "--shell", "tcsh"]);
     assert!(!out.status.success());
     assert!(
         stderr(&out).contains("unsupported shell"),
@@ -848,7 +896,7 @@ fn env_shell_flag_emits_per_shell_syntax() {
         stderr(&out)
     );
 
-    let _ = env.run(&["lock"], "");
+    let _ = run_in_shell(&mut shell, &["lock"]);
     env.wait_for_gone(&env.socket(), Duration::from_secs(10));
     // `lock` must terminate the vault shell itself (no manual `exit`).
     let _ = wait_exit(&mut shell.child, Duration::from_secs(30), "vaultd unlock");

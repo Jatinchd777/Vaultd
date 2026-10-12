@@ -1,8 +1,8 @@
 [package]
 name = "vaultd"
-version = "0.4.4"
+version = "0.5.0"
 edition = "2024"
-description = "Encrypted vault for local dev secrets that exist only while you work."
+description = "Rust CLI and daemon, an AES-256-GCM vault for local dev secrets that exist only while you work."
 license = "GPL-3.0-only"
 repository = "https://github.com/Jatinchd777/Vaultd"
 readme = "README.md"

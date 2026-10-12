@@ -65,10 +65,7 @@ fn read_repairs_clone_permissions() {
         .read_until("vault authentication failed", TIMEOUT);
     let _ = wait_exit(&mut session.child, TIMEOUT, "vaultd unlock");
     assert_eq!(mode(&env.project.path().join(".vaultd")), 0o700);
-    assert_eq!(
-        mode(&env.project.path().join(".vaultd/manifest")),
-        0o600
-    );
+    assert_eq!(mode(&env.project.path().join(".vaultd/manifest")), 0o600);
     assert_eq!(mode(&env.project.path().join(".vaultd/vault")), 0o600);
 }
 

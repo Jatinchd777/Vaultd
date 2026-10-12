@@ -4,6 +4,18 @@ All notable changes to vaultd are documented here. Entries mirror the
 GitHub releases (`v0.1.0` … `v0.4.3`); the top section tracks work not
 yet released.
 
+## [v0.5.0]
+
+### Added
+- Shell-subtree authorization: daemon now checks `SO_PEERCRED` pid plus
+  `/proc` ppid/starttime walk, so only the vault shell and its
+  descendants can use it even with a valid `VAULTD_TOKEN`. Unrelated
+  same-UID processes (other terminals, background jobs) get
+  `authentication failed`. Token + UID checks remain as second factors.
+- Tests: `run_in_shell` helper (commands as shell children via `sh -c`
+  + temp files), outsider-denied assertion, `subtree_self_and_parent` /
+  `subtree_child_passes` units; suite 68 -> 70.
+
 ## [v0.4.4]
 
 ### Fixed
