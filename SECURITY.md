@@ -47,8 +47,20 @@
 
 ## Reporting a vulnerability
 
-Do not open a public issue.
+Do not open a public GitHub issue. Public issues are for bugs only, and
+`blank_issues_enabled` is off for this reason.
 
-Email the maintainer via the GitHub profile for `Jatinchd777/Vaultd` with: `vaultd`, affected versions, repro, impact, and whether ciphertext-only or unlocked-session access is needed. Include `RUSTSEC` if relevant.
+Report privately, in order:
+
+1. GitHub private advisory (preferred, no email needed):
+   `https://github.com/Jatinchd777/Vaultd/security/advisories/new`
+   — enable this tab first under Settings → Code security →
+   `Private vulnerability reporting`.
+2. Email: replace `SECURITY_CONTACT_EMAIL` in this file with your address,
+   then reporters send: `vaultd`, affected versions, repro, impact, and
+   whether ciphertext-only or unlocked-session access is needed. Never send
+   real secrets or passwords, only test vaults.
+
+Include `RUSTSEC` if relevant.
 
 We aim to acknowledge in 72h, fix on `main`, note in `CHANGELOG.md`, and credit you unless you opt out. High severity (plaintext exfil across UID or across projects without session access) gets a patch release; env-inheritance inside the subtree is by design, not a bug.
