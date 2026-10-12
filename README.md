@@ -2,18 +2,14 @@
 
 # vaultd
 
-_Encrypted vault for local dev secrets that exist only while you work._
+_Rust CLI and daemon, an AES-256-GCM vault for local dev secrets that exist only while you work._
 <br>
 <sub>(pronounced: vaultied)</sub>
-<br><br>
+<br>
 
 <a href="LICENSE"><img alt="license" src="https://custom-icon-badges.demolab.com/crates/l/vaultd?color=1C1917&logo=law&style=for-the-badge&logoColor=1C1917&labelColor=FAFAFA"></a>
 <a href="https://crates.io/crates/vaultd"><img alt="version" src="https://img.shields.io/crates/v/vaultd?label=crates.io&color=1C1917&style=for-the-badge&labelColor=FAFAFA"></a>
-<br>
 <img alt="Platform: Linux" src="https://img.shields.io/static/v1?label=platform&message=Linux&style=for-the-badge&labelColor=FAFAFA&color=1C1917">
-<a href="https://github.com/Jatinchd777/Vaultd"><img alt="stars" src="https://img.shields.io/github/stars/Jatinchd777/Vaultd?color=1C1917&logo=github&style=for-the-badge&logoColor=1C1917&labelColor=FAFAFA"></a>
-<br><br>
-<img alt="vaultd demo" src="assets/demo.gif">
 <br>
 
 <a href="#installation">Installation</a>
@@ -23,6 +19,8 @@ _Encrypted vault for local dev secrets that exist only while you work._
 <a href="#how-it-works">How it works</a>
 &middot;
 <a href="#security">Security</a>
+&middot;
+<a href="SECURITY.md">Threat model</a>
 
 </div>
 
@@ -30,7 +28,68 @@ _Encrypted vault for local dev secrets that exist only while you work._
 
 Most of us have committed a `.env` file at least once. vaultd exists so you can stop worrying about that.
 
-Secrets live on disk encrypted. When you need them, they show up as ordinary environment variables in your shell. When you're done, they go away. The project directory keeps only ciphertext.
+Secrets live on disk encrypted (AES-256-GCM, Argon2id key). When you need them, they show up as ordinary environment variables in your shell. When you're done, they go away. The project directory keeps only ciphertext.
+
+<img alt="vaultd demo" src="assets/demo.gif">
+
+See [Threat model](SECURITY.md) for what this stops and what it doesn't.
+
+<h2 id="how-it-works">
+     <sub>
+          <img src="https://cdn.simpleicons.org/rust/white"
+           height="25"
+           width="25">
+     </sub>
+     How it works
+</h2>
+
+A project carries two files:
+
+```
+.vaultd/
+├── manifest    # how to open the vault: version, cipher, key derivation settings and salt
+└── vault       # the encrypted credentials
+```
+
+The manifest is plain JSON. It has to be, since it tells vaultd how to re-derive your key: which algorithm, which settings, which salt. None of that is sensitive. The vault file is the sensitive part. It holds every credential name and value in one encrypted blob.
+
+Unlocking works like this:
+
+1. **Derive the key.** Your password goes through Argon2id with the salt and settings from the manifest. Out comes the key.
+2. **Open the vault.** The key decrypts the vault file. The encryption is authenticated, so a wrong password looks exactly like a damaged file. Either way you get an error and nothing else.
+3. **Hand it to the daemon.** A background daemon holds the decrypted vault in memory. It listens on a per-project Unix socket under `$XDG_RUNTIME_DIR/vaultd` that only your user can connect to, so one project's commands never reach another project's daemon. Every request must also present the unlock session token (`VAULTD_TOKEN`, stored as `vaultd-<hash>.token` next to the socket), and the daemon checks the peer UID plus that the peer is the vault shell itself or one of its descendants (pid + starttime walk, no pid-reuse race), so only that shell subtree can read or modify secrets. Past this point the `vaultd` commands never see keys or ciphertext themselves, they just ask the daemon over that socket.
+4. **Work in the vault shell.** Your shell gets the credentials as environment variables. When you exit the shell, or run `vaultd lock`, the daemon clears its memory, removes the socket and token, and stops.
+
+Each `add`, `set`, and `remove` encrypts the full set of credentials again with a new random nonce before writing. The file on disk never holds old plaintext and never repeats encryption randomness.
+
+<details>
+<summary>The cryptography, concretely</summary>
+
+- **Cipher:** AES-256-GCM. Nonce is 12 random bytes, prepended to the ciphertext.
+- **Key derivation:** Argon2id, 16-byte random salt, `m=19456, t=2, p=1`. Salt is made at `init` time and rotated by `passwd`.
+- **Key size:** 32 bytes. The password itself is only in memory for the moment it takes to derive the key.
+
+</details>
+
+The manifest looks like this, salt and settings are public on purpose, the password is the whole defense:
+
+```jsonc
+// .vaultd/manifest
+{
+  "version": 1,
+  "cipher": "AES-256-GCM",
+  "kdf": {
+    "algorithm": "Argon2id",
+    "salt": "…base64…",
+    "memory_cost": 19456,
+    "time_cost": 2,
+    "parallelism": 1
+  }
+}
+```
+
+> [!IMPORTANT]
+> Back up `.vaultd` somewhere safe, off that machine. Without the password it is unreadable, so losing the files is the same as losing the secrets.
 
 <h2 id="description">
      <sub>
@@ -225,63 +284,6 @@ Master password changed
 
 **Each project is independent.** Unlocking uses a per-project socket, so two projects can stay unlocked side by side without commands crossing over. `lock` locks the current project only.
 
-<h2 id="how-it-works">
-     <sub>
-          <img src="https://cdn.simpleicons.org/rust/white"
-           height="25"
-           width="25">
-     </sub>
-     How it works
-</h2>
-
-A project carries two files:
-
-```
-.vaultd/
-├── manifest    # how to open the vault: version, cipher, key derivation settings and salt
-└── vault       # the encrypted credentials
-```
-
-The manifest is plain JSON. It has to be, since it tells vaultd how to re-derive your key: which algorithm, which settings, which salt. None of that is sensitive. The vault file is the sensitive part. It holds every credential name and value in one encrypted blob.
-
-Unlocking works like this:
-
-1. **Derive the key.** Your password goes through Argon2id with the salt and settings from the manifest. Out comes the key.
-2. **Open the vault.** The key decrypts the vault file. The encryption is authenticated, so a wrong password looks exactly like a damaged file. Either way you get an error and nothing else.
-3. **Hand it to the daemon.** A background daemon holds the decrypted vault in memory. It listens on a per-project Unix socket under `$XDG_RUNTIME_DIR/vaultd` that only your user can connect to, so one project's commands never reach another project's daemon. Every request must also present the unlock session token (`VAULTD_TOKEN`, stored as `vaultd-<hash>.token` next to the socket), and the daemon checks the peer UID, so only that session can read or modify secrets. Past this point the `vaultd` commands never see keys or ciphertext themselves, they just ask the daemon over that socket.
-4. **Work in the vault shell.** Your shell gets the credentials as environment variables. When you exit the shell, or run `vaultd lock`, the daemon clears its memory, removes the socket and token, and stops.
-
-Each `add`, `set`, and `remove` encrypts the full set of credentials again with a new random nonce before writing. The file on disk never holds old plaintext and never repeats encryption randomness.
-
-<details>
-<summary>The cryptography, concretely</summary>
-
-- **Cipher:** AES-256-GCM. Nonce is 12 random bytes, prepended to the ciphertext.
-- **Key derivation:** Argon2id, 16-byte random salt, `m=19456, t=2, p=1`. Salt is made at `init` time and rotated by `passwd`.
-- **Key size:** 32 bytes. The password itself is only in memory for the moment it takes to derive the key.
-
-</details>
-
-The manifest looks like this, salt and settings are public on purpose, the password is the whole defense:
-
-```jsonc
-// .vaultd/manifest
-{
-  "version": 1,
-  "cipher": "AES-256-GCM",
-  "kdf": {
-    "algorithm": "Argon2id",
-    "salt": "…base64…",
-    "memory_cost": 19456,
-    "time_cost": 2,
-    "parallelism": 1
-  }
-}
-```
-
-> [!IMPORTANT]
-> Back up `.vaultd` somewhere safe, off that machine. Without the password it is unreadable, so losing the files is the same as losing the secrets.
-
 <h2 id="security">
      <sub>
           <img src="https://cdn.simpleicons.org/letsencrypt/white"
@@ -306,7 +308,7 @@ Since this guards real secrets, here is what it does and where it stops.
 **What vaultd does not do:**
 
 - Once a secret is in your shell environment, it is out of vaultd's hands. Shell history, process listings, core dumps, a bad dependency phoning home, none of that is something this kind of tool can stop. It protects secrets at rest and on the way to your programs. After that, your programs own them.
-- While the vault is unlocked, any process running as you can ask the daemon for secrets. That is how your dev server gets them too. There is no way to allow one and block the other.
+- While the vault is unlocked, only the vault shell and processes you launch from it can ask the daemon for secrets. That is how your dev server gets them too. Another terminal, background job, or unrelated process running as you — even with a stolen `VAULTD_TOKEN` — gets `authentication failed`. A compromised child still has the plaintext already, so true child isolation still needs a separate UID (`setpriv`/`bwrap`).
 - A weak password breaks the whole thing, because the salt and settings ship with the repo and guesses can be tried offline without limits.
 
 <h2 id="faq">
