@@ -6,6 +6,3 @@ contact_links:
   - name: Security policy
     url: https://github.com/Jatinchd777/Vaultd/blob/main/SECURITY.md
     about: Read before reporting. Public issues are bugs only.
-  - name: Question / discussion
-    url: https://github.com/Jatinchd777/Vaultd/discussions
-    about: Use Discussions for questions, not Issues.
