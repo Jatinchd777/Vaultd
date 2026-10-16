@@ -55,7 +55,7 @@ fn emit(name: &str, value: &str, fish: bool) {
     }
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
 
     matches!(

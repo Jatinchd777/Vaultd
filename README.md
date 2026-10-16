@@ -26,9 +26,7 @@ _Rust CLI and daemon, an AES-256-GCM vault for local dev secrets that exist only
 
 ---
 
-Most of us have committed a `.env` file at least once. vaultd exists so you can stop worrying about that.
-
-Secrets live on disk encrypted (AES-256-GCM, Argon2id key). When you need them, they show up as ordinary environment variables in your shell. When you're done, they go away. The project directory keeps only ciphertext.
+vaultd stores project credentials in an encrypted vault instead of a plaintext `.env` file. Unlock it to work in a shell with those credentials, or use `vaultd run` to provide them to a single command. Credential values are encrypted on disk; `.vaultd/manifest` contains the public settings needed to open the vault.
 
 <img alt="vaultd demo" src="assets/demo.gif">
 
@@ -43,7 +41,7 @@ See [Threat model](SECURITY.md) for what this stops and what it doesn't.
      How it works
 </h2>
 
-A project carries two files:
+Each project has a `.vaultd` directory with two files:
 
 ```
 .vaultd/
@@ -51,16 +49,16 @@ A project carries two files:
 └── vault       # the encrypted credentials
 ```
 
-The manifest is plain JSON. It has to be, since it tells vaultd how to re-derive your key: which algorithm, which settings, which salt. None of that is sensitive. The vault file is the sensitive part. It holds every credential name and value in one encrypted blob.
+`manifest` is a plain JSON file containing the format version and settings needed to derive the encryption key. Those settings, including the random salt, are not secret. `vault` contains the credential names and values in an encrypted blob.
 
-Unlocking works like this:
+When you run `vaultd unlock`, vaultd:
 
-1. **Derive the key.** Your password goes through Argon2id with the salt and settings from the manifest. Out comes the key.
-2. **Open the vault.** The key decrypts the vault file. The encryption is authenticated, so a wrong password looks exactly like a damaged file. Either way you get an error and nothing else.
-3. **Hand it to the daemon.** A background daemon holds the decrypted vault in memory. It listens on a per-project Unix socket under `$XDG_RUNTIME_DIR/vaultd` that only your user can connect to, so one project's commands never reach another project's daemon. Every request must also present the unlock session token (`VAULTD_TOKEN`, stored as `vaultd-<hash>.token` next to the socket), and the daemon checks the peer UID plus that the peer is the vault shell itself or one of its descendants (pid + starttime walk, no pid-reuse race), so only that shell subtree can read or modify secrets. Past this point the `vaultd` commands never see keys or ciphertext themselves, they just ask the daemon over that socket.
-4. **Work in the vault shell.** Your shell gets the credentials as environment variables. When you exit the shell, or run `vaultd lock`, the daemon clears its memory, removes the socket and token, and stops.
+1. **Derives an encryption key.** Argon2id turns your password and the salt in `manifest` into the key. The password is not saved.
+2. **Decrypts the vault.** AES-256-GCM checks the ciphertext as it decrypts it. A wrong password or modified vault file produces an error.
+3. **Starts a per-project daemon.** The daemon keeps the decrypted credentials in memory and serves commands over a private Unix socket under `$XDG_RUNTIME_DIR/vaultd`. Requests are authenticated with a session token and checked against the UID and process tree of the vault shell. Each project has a separate socket and session.
+4. **Opens your vault shell.** Credentials are set as environment variables in this shell and its child processes. When the shell exits or you run `vaultd lock`, vaultd stops the daemon and clears its in-memory vault.
 
-Each `add`, `set`, and `remove` encrypts the full set of credentials again with a new random nonce before writing. The file on disk never holds old plaintext and never repeats encryption randomness.
+`add`, `set`, and `remove` write the updated encrypted vault using a fresh random nonce. Plaintext credentials are not written to the project directory.
 
 <details>
 <summary>The cryptography, concretely</summary>
@@ -71,7 +69,7 @@ Each `add`, `set`, and `remove` encrypts the full set of credentials again with 
 
 </details>
 
-The manifest looks like this, salt and settings are public on purpose, the password is the whole defense:
+For example, `manifest` contains the algorithm and key-derivation settings. These values are public; your password protects the vault:
 
 ```jsonc
 // .vaultd/manifest
@@ -89,7 +87,7 @@ The manifest looks like this, salt and settings are public on purpose, the passw
 ```
 
 > [!IMPORTANT]
-> Back up `.vaultd` somewhere safe, off that machine. Without the password it is unreadable, so losing the files is the same as losing the secrets.
+> Back up the `.vaultd` directory somewhere safe. You need both the files and the master password to recover your credentials. vaultd has no password reset or recovery key.
 
 <h2 id="description">
      <sub>
@@ -103,62 +101,70 @@ The manifest looks like this, salt and settings are public on purpose, the passw
 ### Features
 
 > [!TIP]
-> Skip `VALUE` and let vaultd prompt for it without echoing. That keeps secrets out of shell history and the process list. More habits in [Usage](#usage).
+> Leave `VALUE` off `add` and `set` commands. vaultd prompts without echoing it, so the value won't appear in shell history or the command's argument list.
 
-- **Encrypted at rest, plain in use** - [Read More](#how-it-works)
-  - Secrets live in `.vaultd/` as one AES-256-GCM blob, safe to commit to git
-  - Master password is never stored anywhere; forget it and the vault is gone
-  - Every write re-encrypts everything under a fresh random nonce
+- **Encrypted on disk**
+  - Credential names and values are stored together in an AES-256-GCM encrypted file
+  - The master password is never saved; there is no password reset
+  - Each change encrypts the updated vault with a new random nonce
 
-- **A vault shell for every session** - [Read More](#quick-start)
-  - `vaultd unlock` checks the password and drops you into a shell that has your secrets
-  - Apps read them like any other environment variable, no code changes
-  - `exit` or `vaultd lock` wipes memory and locks the vault again
+- **A shell with credentials for a work session**
+  - `vaultd unlock` verifies the password and opens `bash`, `zsh`, or `fish` with credentials in its environment
+  - Programs launched from that shell can read credentials as normal environment variables
+  - `exit` or `vaultd lock` ends the session
 
-- **Per-project daemons that mind their own business** - [Read More](#how-it-works)
-  - Each project gets its own Unix socket under `$XDG_RUNTIME_DIR/vaultd`, so two projects stay unlocked side by side without commands crossing over
-  - Every request must present the unlock session token (`VAULTD_TOKEN`), and the daemon checks the peer UID
-  - `$VAULTD_SOCKET` values pointing outside the runtime dir are rejected
+- **One-command access without a vault shell**
+  - `vaultd run -- <command> [args...]` gives credentials directly to the launched program as process environment variables
+  - No shell exports, intermediate shell, or background daemon; your current shell's environment is unchanged
 
-- **Owner-only files, even after `git clone`** - [Read More](#security)
-  - `.vaultd` is `0700`, both files `0600`, created under `umask 077`
-  - Git doesn't preserve those modes, so vaultd tightens them back on every read and write
-  - Symlinked `.vaultd` dirs and `manifest`/`vault` files are refused, never followed
+- **Separate sessions for separate projects**
+  - Each unlocked project has its own daemon and private socket
+  - Requests must present the session token and come from the vault shell or one of its child processes
 
-- **`add` creates, `set` updates, neither guesses** - [Read More](#usage)
-  - Mixing them up errors out instead of quietly overwriting something or making a duplicate
-  - `list` shows names only, values stay hidden
-  - `passwd` re-encrypts everything under a fresh salt; the old password stops working
+- **Restricted file access**
+  - `.vaultd` is created with owner-only permissions; vaultd reapplies them after a clone
+  - Symlinked vault directories and files are rejected
+
+- **Explicit credential changes**
+  - `add` creates a name and `set` updates one; using the wrong command reports an error
+  - `list` shows names, not values
+  - `passwd` re-encrypts the vault with a new salt and password
 
 ## Quick Start
 
-One-time setup per project:
+Initialize the vault once from the project directory:
 
 ```sh
 vaultd init
-# pick a master password when asked
+# choose a strong master password when prompted
 ```
 
-Start of every dev session:
+To work in a vault shell:
 
 ```sh
 vaultd unlock
-# type the master password, you get a vault shell
+# enter the master password when prompted
 
 vaultd add API_KEY
-# leave VALUE off, vaultd prompts without echoing
+# enter the value when prompted; it won't be echoed
 
 python app.py
-# apps read it like any other env var
+# the program can read API_KEY from its environment
 
 exit
-# leaving the shell locks the vault
+# leaving the vault shell ends the session
 ```
 
-While unlocked you work in a shell that has your secrets. When you leave, the secrets are wiped from memory and the vault locks itself.
+For a single command, you can instead run:
+
+```sh
+vaultd run -- python app.py
+```
+
+`run` prompts for the master password, then starts the requested program with the credentials directly in that process's environment. It does not generate shell `export` commands, invoke an intermediate shell, or start the vault daemon. The credentials are not added to your current shell; when the program exits, `vaultd` returns its exit status.
 
 > [!CAUTION]
-> Commit `.vaultd` to git. Keep the master password out of it, and out of everywhere else too. Forget the password and the vault is gone. There is no reset flow.
+> You can commit `.vaultd` so another machine or teammate can access the encrypted vault, but anyone with a copy can attempt password guesses offline. Use a strong, unique password and never store it in the repository. Without the password, the vault cannot be recovered.
 
 <h2 id="supported-platforms">
      <sub>
@@ -171,7 +177,7 @@ While unlocked you work in a shell that has your secrets. When you leave, the se
 
 - Linux
 
-You also need `zsh`, `bash`, or `fish`, since the vault shell runs on `zsh -i`, `bash -i`, or `fish -i` (detected from your invoking shell, override with `VAULTD_SHELL`), and a Rust toolchain if you're building from source.
+The interactive vault shell requires `bash`, `zsh`, or `fish`. vaultd detects the shell you launched it from; set `VAULTD_SHELL` to `bash`, `zsh`, or `fish` to choose one explicitly. `vaultd run` starts the requested program directly and does not need an interactive shell. Building from source requires the Rust toolchain.
 
 <h2 id="installation">
      <sub>
@@ -243,23 +249,24 @@ cp target/release/vaultd $HOME/.local/bin/
 
 ## Usage
 
-Run these from anywhere inside the project, vaultd finds `.vaultd` by walking up. Except for `init` and `passwd` (which work while locked), every command needs an unlocked vault, so `unlock` comes first.
+Run vaultd from anywhere inside a project; it searches the current directory and its parents for `.vaultd`. `init` creates a vault and `passwd` changes its password while it is locked. Credential commands such as `add`, `get`, and `list` require an active vault shell. `run` is different: it prompts for the password and opens the vault just for the command.
 
 | Command | What it does |
 |---|---|
-| `vaultd init` | Create `.vaultd` and set the master password |
-| `vaultd unlock` | Check the password, start the daemon, open the vault shell |
-| `vaultd passwd` | Change the master password (prompts, takes no arguments; run while locked) |
-| `vaultd add <NAME> [VALUE]` | Store a new credential, errors if the name exists |
-| `vaultd set <NAME> [VALUE]` | Update a credential, errors if the name is missing |
+| `vaultd init` | Create `.vaultd` and choose a master password |
+| `vaultd unlock` | Prompt for the password, start the daemon, and open a vault shell |
+| `vaultd passwd` | Change the master password while locked |
+| `vaultd add <NAME> [VALUE]` | Add a credential; prompts securely if `VALUE` is omitted |
+| `vaultd set <NAME> [VALUE]` | Update a credential; prompts securely if `VALUE` is omitted |
 | `vaultd get <NAME>` | Print a credential value |
 | `vaultd remove <NAME>` | Delete a credential |
-| `vaultd list` | Show credential names, never values |
-| `vaultd lock` | Lock the current project's vault |
+| `vaultd list` | Show credential names without their values |
+| `vaultd lock` | End the current project's vault session |
+| `vaultd run -- <COMMAND> [ARGS...]` | Prompt for the password and run one program with vault credentials in its environment |
 
-A few things worth knowing:
+### Managing credentials
 
-**`add` creates, `set` updates.** Mixing them up gives you an error instead of quietly overwriting something or creating a duplicate.
+Use `add` for a new name and `set` to change an existing one. vaultd returns an error if the name already exists or does not exist, rather than silently creating or replacing a credential.
 
 **Skip `VALUE` when you can.** Leave it off and vaultd asks for it without echoing:
 
@@ -268,9 +275,11 @@ $ vaultd add STRIPE_KEY
 Credential value: ********
 ```
 
-That is the better habit. Typed inline, a secret lands in shell history and shows up in the process list while the command runs.
+Entering the value at the prompt keeps it out of shell history and the process argument list. Avoid passing real secrets as `VALUE`.
 
-**`passwd` never takes a password on the command line.** It asks for the current password, then the new one twice, with no echo, same as `init`. New passwords must be at least 12 characters and must not be one of the most common real-world passwords — the salt and KDF settings ship with the repo, so a weak password falls to offline guessing. It re-encrypts everything under a fresh salt, so the old password stops working. If the vault is unlocked, `lock` first:
+### Changing the master password
+
+`passwd` takes no password arguments. It prompts for the current password and asks for the new password twice without echoing them. New passwords must be at least 12 characters and cannot be among a short list of common passwords. The vault is re-encrypted with a fresh salt, so the old password no longer works. Lock the vault before changing the password:
 
 ```sh
 $ vaultd lock
@@ -282,7 +291,22 @@ Confirm new password: ********
 Master password changed
 ```
 
-**Each project is independent.** Unlocking uses a per-project socket, so two projects can stay unlocked side by side without commands crossing over. `lock` locks the current project only.
+### Running one command
+
+Use `run` when you need secrets for a single process rather than an interactive shell:
+
+```sh
+vaultd run -- cargo test
+vaultd run -- python app.py --debug
+```
+
+After `--`, provide the program and its arguments. vaultd launches that program directly and supplies the credentials in the environment the operating system gives it at startup. No shell parses the command or exports variables, and the credentials are not added to your current shell. Vault credentials replace inherited variables with matching names; `run` returns the child's exit status.
+
+This can reduce exposure compared with opening a shell that has every credential: only the program you launch initially receives them. It is not a secret channel or a sandbox—the program and its child processes can read or copy the environment values. Use `run` only with programs you trust.
+
+### Locking a vault
+
+`unlock` opens a separate session for each project, so multiple projects can remain unlocked at once. `vaultd lock` ends the session for the current project only.
 
 <h2 id="security">
      <sub>
@@ -293,23 +317,23 @@ Master password changed
      Security
 </h2>
 
-Since this guards real secrets, here is what it does and where it stops.
+vaultd protects the vault file and controls which local processes can use an unlocked session. It cannot protect credentials after a program has received them.
 
 **What it does:**
 
-- The blob is sealed with AES-256-GCM, which covers secrecy and tampering in one go. Edited ciphertext does not decrypt to something wrong. It does not decrypt at all.
-- The key comes from Argon2id with a random salt made at `init` time (rotated by `passwd`). Deriving it costs real work on every unlock, and the same work per guess for anyone trying passwords offline.
-- The password itself is never written anywhere. It is only in memory for the moment it takes to derive the key. That is why forgetting it is final.
-- Committing `.vaultd` is safe because all an attacker gets is ciphertext, a salt, and derivation settings. The salt and settings are public on purpose. The password is the whole defense against offline guessing, so it should be a generated passphrase, not a word you picked.
-- The vault directory is `0700` and both files are `0600`, created under `umask 077`, so other local users never get the ciphertext in the first place. Git does not preserve those modes, so after a clone the files may come back `0755`/`0644`, vaultd tightens them back on every read and write. Symlinked `.vaultd` directories and `manifest`/`vault` files are refused rather than followed, and `$VAULTD_SOCKET` values pointing outside `$XDG_RUNTIME_DIR/vaultd` are rejected.
-- On lock, the daemon zeroes the key and the decrypted secrets. That shrinks how long they sit in RAM. It cannot pull back copies your shell, scrollback, or child processes already hold.
-- Once locked, nothing secret remains in memory. The key and plaintext are gone and disk holds ciphertext again.
+- **Encryption:** AES-256-GCM encrypts the vault and detects changes to its ciphertext. A modified vault will fail to decrypt.
+- **Password protection:** Argon2id derives a 256-bit key from the password and a random 16-byte salt. The salt and settings are stored in `manifest`; they are public. Anyone with a copy of the vault can try password guesses offline, so use a strong, unique password.
+- The password itself is never written to disk. It is held in memory while vaultd derives the key; forgetting it means the vault cannot be opened.
+- **Sharing the vault:** A copy of `.vaultd` contains ciphertext, not plaintext, but it can be used for offline password guessing. Choose a strong, unique password before sharing or committing it.
+- **File permissions:** `.vaultd` is restricted to your user (`0700`) and its files to the owner (`0600`). vaultd reapplies these permissions because Git does not preserve them. Symlinked vault directories and files are rejected.
+- **Unlocked sessions:** The daemon uses a private per-project Unix socket, a random session token, and process-tree checks to limit requests to the vault shell and its descendants. `lock` removes the socket and token and zeroizes the daemon's key and decrypted credentials.
+- **Memory lifetime:** Locking clears the daemon's copies. It cannot clear copies already inherited by shells or programs, or remove them from scrollback, logs, or crash dumps.
 
 **What vaultd does not do:**
 
-- Once a secret is in your shell environment, it is out of vaultd's hands. Shell history, process listings, core dumps, a bad dependency phoning home, none of that is something this kind of tool can stop. It protects secrets at rest and on the way to your programs. After that, your programs own them.
-- While the vault is unlocked, only the vault shell and processes you launch from it can ask the daemon for secrets. That is how your dev server gets them too. Another terminal, background job, or unrelated process running as you — even with a stolen `VAULTD_TOKEN` — gets `authentication failed`. A compromised child still has the plaintext already, so true child isolation still needs a separate UID (`setpriv`/`bwrap`).
-- A weak password breaks the whole thing, because the salt and settings ship with the repo and guesses can be tried offline without limits.
+- `vaultd run` passes secrets directly in the launched process's environment; it does not export them into the caller's shell. The receiving program can read them, pass them to child processes, or copy them elsewhere. Environment variables may also be visible through operating-system process inspection, crash dumps, or debugging tools.
+- A compromised process inside a vault shell can use the credentials it inherits. For untrusted code, use a separate user or an isolation tool such as `bwrap`.
+- A weak or reused password can be guessed offline by someone with a copy of `.vaultd`. vaultd cannot recover a vault if you lose the password or the files.
 
 <h2 id="faq">
      <sub>
@@ -322,27 +346,27 @@ Since this guards real secrets, here is what it does and where it stops.
 
 **I forgot my master password. How do I reset it?**
 
-You don't. There is no reset flow and no back door, the password is never stored anywhere. If it is gone, the vault is gone. Delete `.vaultd`, run `vaultd init` again, and re-enter your secrets.
+There is no reset or recovery key because vaultd does not store the password. If you cannot remember it, the encrypted vault cannot be opened. You can remove `.vaultd`, run `vaultd init` again, and enter your credentials into a new vault.
 
 **`vaultd unlock` says the daemon is already running. What now?**
 
-You're already inside a vault shell for this project, or a previous shell didn't exit cleanly. Check for the shell, `exit` it or run `vaultd lock`, then unlock again. A stale socket is cleaned up automatically.
+This project already has an active vault session, or an earlier session did not exit cleanly. If you are in its vault shell, run `exit` or `vaultd lock`. Then try unlocking again. vaultd cleans up stale sockets.
 
 **`no vault found`, but I just ran `init`?**
 
-You're outside the project. vaultd looks for `.vaultd` in the current directory and every parent. `cd` back into the project (or a subdirectory of it) and try again. `init` also refuses nested vaults, so you can't init inside an existing one.
+vaultd searches the current directory and its parents for `.vaultd`. Change into the project (or one of its subdirectories) and try again. `init` refuses to create a nested vault inside an existing one.
 
 **My secrets don't show up in a new terminal.**
 
-That's on purpose. Secrets only exist inside the vault shell that `unlock` opened. Open a new terminal and you get a plain shell with no secrets. Run `vaultd unlock` there if you need them, each project gets its own session.
+That is expected: `unlock` adds credentials only to the vault shell it opens and programs started from that shell. In another terminal, run `vaultd unlock` for a separate session, or use `vaultd run -- <command>` for one program.
 
 **Permissions look wrong after `git clone`.**
 
-Normal. Git doesn't keep `0600`/`0700` modes, so files come back `0644`/`0755`. vaultd tightens them back on every read and write. You don't need to `chmod` anything by hand.
+Git does not preserve `0600`/`0700` modes, so a checkout may have broader permissions. vaultd reapplies the required permissions when it reads or writes vault files.
 
 **Which shells are supported?**
 
-You need `zsh`, `bash`, or `fish`. vaultd detects the shell you ran `unlock` from (`$BASH_VERSION`/`$ZSH_VERSION`/`$FISH_VERSION`, parent process, then `$SHELL`, falling back to `zsh`) and spawns the same shell with your secrets. Set `VAULTD_SHELL=bash`, `VAULTD_SHELL=zsh`, or `VAULTD_SHELL=fish` to override. If the detected shell is missing, unlocking fails when it tries to spawn it.
+The interactive vault shell supports `bash`, `zsh`, and `fish`. vaultd detects the shell you used to run `unlock`; set `VAULTD_SHELL=bash`, `VAULTD_SHELL=zsh`, or `VAULTD_SHELL=fish` to choose one explicitly. The selected shell must be installed. `vaultd run` starts a program directly and does not require one of these shells.
 
 <h2 id="development">
      <sub>

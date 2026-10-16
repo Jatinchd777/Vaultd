@@ -1,8 +1,30 @@
 # Changelog
 
 All notable changes to vaultd are documented here. Entries mirror the
-GitHub releases (`v0.1.0` … `v0.4.3`); the top section tracks work not
+GitHub releases (`v0.1.0` … `v0.5.1`); the top section tracks work not
 yet released.
+
+## [v0.5.1]
+
+### Added
+- `vaultd run -- <command> [args...]`: prompts for the master password,
+  decrypts the project vault, and launches one program with credentials
+  directly in its environment without starting a shell or daemon. The
+  caller's shell is unchanged and the command's exit status is returned.
+- Example program `examples/check_vault_env.rs` for checking environment
+  delivery with a test value.
+
+### Changed
+- README and `SECURITY.md` explain the vault workflow, `run` behavior, and
+  security boundaries in clearer terms.
+- CLI help includes `run`.
+
+### Tests
+- Added integration coverage for passing credentials to the child program,
+  overriding an inherited variable, and returning the child's exit status.
+- Full suite: 73 tests pass.
+
+No daemon protocol change. Existing vaults and sessions remain compatible.
 
 ## [v0.5.0]
 

@@ -1,6 +1,8 @@
 //! CLI surface: help output, argument validation, and behavior when no
 //! daemon is running. None of these need a vault on disk.
 
+mod run;
+
 use crate::common::{Env, stderr, stdout};
 
 #[test]
@@ -10,10 +12,18 @@ fn help_lists_subcommands() {
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
     for cmd in [
-        "init", "unlock", "lock", "get", "set", "add", "remove", "list",
+        "init", "unlock", "lock", "get", "set", "add", "remove", "list", "run",
     ] {
         assert!(text.contains(cmd), "help missing {cmd}:\n{text}");
     }
+}
+
+#[test]
+fn run_requires_a_program_after_separator() {
+    let env = Env::new("cli-run-no-command");
+    let out = env.run(&["run"], "");
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("COMMAND"));
 }
 
 #[test]

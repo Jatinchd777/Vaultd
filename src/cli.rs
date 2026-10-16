@@ -1,3 +1,5 @@
+use std::ffi::OsString;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -56,6 +58,13 @@ pub enum Command {
 
     /// Change the master password (prompts, takes no arguments).
     Passwd,
+
+    /// Run a command with the vault credentials in its environment.
+    Run {
+        /// Program and arguments (pass after `--`).
+        #[arg(last = true, required = true, num_args = 1.., value_name = "COMMAND")]
+        command: Vec<OsString>,
+    },
 
     #[command(name = "__env", hide = true)]
     Env {

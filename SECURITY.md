@@ -1,66 +1,67 @@
 # Security Policy
 
+This document describes what vaultd protects, what it assumes, and how to report a vulnerability.
+
 ## Supported versions
 
 | Version | Supported |
 |---|---|
 | latest `main` / crates.io release | yes |
-| older releases | no, update first |
+| older releases | no; update to the latest release |
 
-## Assets
+## What vaultd stores
 
-- `vault` file: all names + values, one AES-256-GCM blob.
-- `manifest` file: version, cipher, KDF algorithm + salt + settings. Public by design.
-- Runtime: daemon memory (key + plaintext), `$XDG_RUNTIME_DIR/vaultd/vaultd-<hash>.sock` (`0600`), `.token` sibling (`0600`), vault-shell env (`VAULTD_SOCKET`, `VAULTD_TOKEN`, secrets).
+- **`.vaultd/vault`:** credential names and values, encrypted together with AES-256-GCM.
+- **`.vaultd/manifest`:** format version, cipher, and Argon2id parameters, including the random salt. These settings are public and are required to derive the key.
+- **Unlocked session:** the key and decrypted credentials in daemon memory, or temporarily in the `vaultd run` process. In an interactive session, credentials are also present in the vault shell and its child processes' environments.
+- **Runtime files:** an owner-only Unix socket and session-token file under `$XDG_RUNTIME_DIR/vaultd` (or the per-user temporary runtime directory when XDG is not configured).
 
-## Attackers considered
+## Threat model
 
-- Git reader / stolen laptop: gets ciphertext + salt, tries offline password guessing.
-- Other local UID: tries to read `.vaultd/`, connect to socket, spoof `$VAULTD_SOCKET`.
-- Same UID, outside session: other terminal, background job, editor plugin, cron. Tries path guess + token-file read + `/proc/*/environ` read to reach another project's daemon.
-- Same UID, inside session: compromised child (dev server dep, `npm install`). Already inherits secrets via env.
-- Malicious ciphertext: edited `vault`/`manifest` on disk or in git.
+vaultd is designed to protect credentials stored in a project directory and to restrict access to an unlocked daemon. It considers:
+
+- Someone who can read a repository or a copied device and tries offline password guesses against `.vaultd`.
+- Another local user attempting to read vault files or connect to the daemon.
+- An unrelated process running as the same user attempting to access a project's unlocked daemon from outside its vault shell.
+- A modified or corrupted vault or manifest.
+
+vaultd does not treat programs launched inside an unlocked vault shell, or the program launched with `vaultd run`, as trusted boundaries. Those programs receive the credentials and can use or copy them.
 
 ## What vaultd does
 
-- At rest: AES-256-GCM, 12-byte random nonce per write, prepended. Tamper fails closed, never wrong plaintext. Every `add`/`set`/`remove` re-encrypts all with fresh nonce.
-- KDF: Argon2id `m=19456, t=2, p=1`, 16-byte salt at `init`, rotated by `passwd`. Same cost for you and guessers. Password only in memory to derive the 32-byte key.
-- Files: `.vaultd/` `0700`, files `0600`, `umask 077`. Tightened on every read/write after `git clone`. Symlinked dir/files refused. No nested vaults. `manifest`/`vault` parse errors fail as auth failure.
-- IPC: per-project socket `SHA-256(project root)` under `0700` runtime dir. `$VAULTD_SOCKET` outside it rejected. Client + daemon check `SO_PEERCRED` UID, fail closed. 5s timeouts, 1MiB cap, max 16 workers with `busy` reply.
-- Session: 32-byte `OsRng` token per `unlock`, hex in env + `0600` file, constant-time compare, removed on `lock`/exit. Daemon pins vault-shell `pid + starttime` (survives `exec`) and walks `/proc` ppid chain per connection. Only shell + descendants pass, even with valid token. Stale sockets cleaned without following symlinks.
-- Memory: `zeroize` on key + plaintext + prompt buffers at `lock`/drop. `lock` removes socket/token first, then `SIGKILL`s shell via held `pidfd` after 500ms grace. Shell also self-exits at next prompt when socket is gone.
+- **Encryption:** AES-256-GCM encrypts the vault and detects tampering. Each write uses a fresh 12-byte random nonce. A wrong password or modified ciphertext fails to decrypt.
+- **Key derivation:** Argon2id derives a 32-byte key using `m=19456, t=2, p=1` and a random 16-byte salt. `init` creates the salt; `passwd` generates a new one when changing the password.
+- **Password handling:** the master password is not stored. New passwords must be at least 12 characters and cannot match the top-10 common-password list checked by vaultd. This policy applies to `init` and `passwd`; existing vaults with weaker passwords can still be opened.
+- **File permissions:** `.vaultd` is set to `0700`, and its files to `0600`, under `umask 077`. vaultd reapplies these permissions because Git does not preserve them. Symlinked vault directories and files are rejected.
+- **Interactive session isolation:** each project uses its own Unix socket. The daemon checks the connecting UID, the session token, and whether the peer process is the vault shell or one of its descendants. Socket paths supplied through `VAULTD_SOCKET` must remain inside vaultd's runtime directory. Requests have timeouts and message-size limits.
+- **Locking:** `lock` removes the socket and token, clears the daemon's key and decrypted credentials, and ends the vault shell. Key, plaintext, and password prompt buffers are zeroized when released.
+- **One-command execution:** `vaultd run -- <command> [args...]` decrypts the vault in the `vaultd` process and starts the requested program directly with credentials in its process environment. No shell exports or intermediate shell are used; the invoking shell's environment is unchanged. Vault values replace inherited variables with matching names. The child program's exit status is returned.
 
 ## What vaultd does not do
 
-- Env leak: `ps e`, `/proc/*/environ`, history, scrollback, core dumps keep copies `lock` cannot pull back.
-- Subtree children: everything you run from the vault shell gets secrets + daemon. For untrusted builds use a separate UID (`setpriv`, `sudo -u`, `bwrap`, `systemd-run --uid`) and pass only needed vars.
-- Passwords: <12 chars or top-10 common rejected at `init`/`passwd`, but a weak older vault still opens. Salt ships with repo, guesses are unlimited offline. No reset, no escrow, no team ACLs or audit log.
-- Availability: daemon dies with shell. No backup; losing `.vaultd/` or password loses secrets.
+- **Prevent offline guessing:** anyone with a copy of `.vaultd` can make password guesses without contacting vaultd. The salt and KDF settings are public; use a strong, unique password.
+- **Protect secrets after delivery:** `run` narrows initial delivery to the launched program instead of exporting credentials into the caller's shell, but it is not a secret channel or sandbox. The program can read, log, transmit, or pass credentials to child processes. Environment variables may also be visible through operating-system process inspection, crash dumps, or debugging tools.
+- **Sandbox commands:** `vaultd run` limits initial delivery to one program, but is not process isolation. The `vaultd` process keeps the decrypted vault in memory while that program runs and zeroizes it after the program exits. Use a separate user or an isolation tool for untrusted code.
+- **Recover lost data:** vaultd has no password reset, escrow, or recovery key. Losing the password or the `.vaultd` files means losing access to the credentials.
+- **Provide team access controls or audit logs:** anyone who has both the encrypted files and the master password can open the vault. Access control and recovery for teams are outside the current design.
 
 ## Secure use
 
-1. Generated passphrase, unique per project. `lock` before `passwd`.
-2. `vaultd add NAME` without value so it prompts with no echo. Never paste secrets in `VALUE`, chat, or tickets.
-3. Commit `.vaultd`, never the password. Back it up off-machine.
-4. `exit` when done. New terminal needs its own `unlock`.
-5. Check `ls -l .vaultd`, `ss -x | grep vaultd` if socket behavior surprises you.
+1. Use a generated, unique master password for each vault. Store a backup of `.vaultd` somewhere safe, separately from the password.
+2. Use `vaultd add NAME` or `vaultd set NAME` without a value argument so vaultd prompts without echoing the credential. Avoid putting real values in shell history or command arguments.
+3. Commit `.vaultd` only if you intend to share the encrypted vault. Never commit or otherwise store the master password beside it.
+4. Exit the vault shell or run `vaultd lock` when you are done. Use `vaultd run` when one command needs credentials, and only run programs you trust with them.
+5. If socket behavior is unexpected, check the permissions on `.vaultd` and the runtime directory.
 
 ## Reporting a vulnerability
 
-Do not open a public GitHub issue. Public issues are for bugs only, and
-`blank_issues_enabled` is off for this reason.
+Do not report vulnerabilities in a public GitHub issue. Public issues are for bugs; `blank_issues_enabled` is off for this reason.
 
-Report privately, in order:
+Report privately:
 
-1. GitHub private advisory (preferred, no email needed):
-   `https://github.com/Jatinchd777/Vaultd/security/advisories/new`
-   — enable this tab first under Settings → Code security →
-   `Private vulnerability reporting`.
-2. Email: replace `SECURITY_CONTACT_EMAIL` in this file with your address,
-   then reporters send: `vaultd`, affected versions, repro, impact, and
-   whether ciphertext-only or unlocked-session access is needed. Never send
-   real secrets or passwords, only test vaults.
+1. **GitHub private advisory (preferred):** <https://github.com/Jatinchd777/Vaultd/security/advisories/new>. If private vulnerability reporting is not enabled, a repository administrator must enable it under **Settings → Code security → Private vulnerability reporting**.
+2. **Email:** replace `SECURITY_CONTACT_EMAIL` in this file with the project's security contact address. Include the affected version, reproduction steps, impact, and whether the report requires access to ciphertext only or an unlocked session. Do not send real credentials or passwords; use test vaults.
 
-Include `RUSTSEC` if relevant.
+Include a `RUSTSEC` advisory reference if relevant.
 
-We aim to acknowledge in 72h, fix on `main`, note in `CHANGELOG.md`, and credit you unless you opt out. High severity (plaintext exfil across UID or across projects without session access) gets a patch release; env-inheritance inside the subtree is by design, not a bug.
+We aim to acknowledge reports within 72 hours, fix confirmed issues on `main`, document fixes in `CHANGELOG.md`, and credit reporters unless they prefer not to be named. Vulnerabilities that allow plaintext access across users or projects without access to the relevant session will be treated as high severity. Credential inheritance by programs launched inside a vault shell or with `vaultd run` is intentional behavior, not a vulnerability by itself.
